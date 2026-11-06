@@ -96,8 +96,12 @@ export class RateLimiter {
         await browser.storage.local.remove(staleKeys);
       }
     })();
-    await this.rpdLoadingPromise;
-    this.rpdLoadingPromise = null;
+    try {
+      await this.rpdLoadingPromise;
+    } finally {
+      // 讀取失敗也要清掉共用 Promise，讓後續 acquire 能重新載入。
+      this.rpdLoadingPromise = null;
+    }
   }
 
   async persistRpd() {
