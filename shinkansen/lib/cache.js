@@ -30,6 +30,16 @@ const EVICTION_CHECK_INTERVAL_MS = 30_000; // 最多每 30 秒檢查一次
 const pendingTouches = {};
 let touchFlushTimer = null;
 const TOUCH_FLUSH_DELAY_MS = 5000; // 5 秒後統一 flush
+// 清除期間不更新讀取時間戳；跨越清除邊界的讀取也不能回寫舊值。
+let touchGeneration = 0;
+let activeClears = 0;
+const inFlightTouchWrites = new Set();
+
+function writeTouches(updates) {
+  const write = browser.storage.local.set(updates).catch(() => {});
+  inFlightTouchWrites.add(write);
+  write.then(() => inFlightTouchWrites.delete(write));
+}
 
 function scheduleTouchFlush() {
   if (touchFlushTimer) return; // 已排程，不重複
@@ -43,7 +53,7 @@ function flushTouches() {
   if (!keys.length) return;
   // 清空 pending（先清再寫，避免 flush 期間的新 touch 被漏掉）
   for (const k of keys) delete pendingTouches[k];
-  browser.storage.local.set(updates).catch(() => {}); // fire-and-forget
+  writeTouches(updates); // fire-and-forget，但 clearAll 會等待已開始的寫入
 }
 
 async function hashText(text) {
@@ -194,6 +204,7 @@ async function proactiveEvictionCheck() {
  */
 export async function getBatch(texts, keySuffix = '') {
   if (!texts.length) return [];
+  const generation = touchGeneration;
   const hashes = await Promise.all(texts.map(hashText));
   const keys = hashes.map(h => KEY_PREFIX + h + keySuffix);
   const stored = await browser.storage.local.get(keys);
@@ -202,7 +213,7 @@ export async function getBatch(texts, keySuffix = '') {
   const results = keys.map(k => {
     if (!(k in stored)) return null;
     const val = extractValue(stored[k]);
-    if (val != null) {
+    if (val != null && generation === touchGeneration && activeClears === 0) {
       pendingTouches[k] = wrapValue(val);
     }
     return val;
@@ -241,6 +252,7 @@ export async function setBatch(texts, translations, keySuffix = '') {
  * @returns {Promise<Array|null>} 快取命中時回傳術語陣列，否則 null
  */
 export async function getGlossary(inputHash) {
+  const generation = touchGeneration;
   const key = GLOSSARY_PREFIX + inputHash;
   const stored = await browser.storage.local.get(key);
   if (!(key in stored)) return null;
@@ -249,7 +261,9 @@ export async function getGlossary(inputHash) {
   if (Array.isArray(entry)) return entry;
   if (entry && typeof entry === 'object' && Array.isArray(entry.v)) {
     // 更新時間戳（fire-and-forget）
-    browser.storage.local.set({ [key]: { v: entry.v, t: Date.now() } }).catch(() => {});
+    if (generation === touchGeneration && activeClears === 0) {
+      writeTouches({ [key]: { v: entry.v, t: Date.now() } });
+    }
     return entry.v;
   }
   return null;
@@ -272,12 +286,25 @@ export { hashText };
  * 清除所有翻譯快取與術語表快取（保留版本標記等其他 local storage 內容）。
  */
 export async function clearAll() {
-  const all = await browser.storage.local.get(null);
-  const toRemove = Object.keys(all).filter(k => k.startsWith(KEY_PREFIX) || k.startsWith(GLOSSARY_PREFIX));
-  if (toRemove.length) {
-    await browser.storage.local.remove(toRemove);
+  activeClears++;
+  touchGeneration++;
+  if (touchFlushTimer !== null) clearTimeout(touchFlushTimer);
+  touchFlushTimer = null;
+  for (const key of Object.keys(pendingTouches)) delete pendingTouches[key];
+  try {
+    // 已送出的 storage.set 無法取消，先等它完成再刪除，避免清除後復活。
+    await Promise.all([...inFlightTouchWrites]);
+    const all = await browser.storage.local.get(null);
+    const toRemove = Object.keys(all).filter(k => k.startsWith(KEY_PREFIX) || k.startsWith(GLOSSARY_PREFIX));
+    if (toRemove.length) {
+      await browser.storage.local.remove(toRemove);
+    }
+    return toRemove.length;
+  } finally {
+    // 清除期間開始的讀取即使稍後才回來，也不得重新寫入舊快取。
+    touchGeneration++;
+    activeClears--;
   }
-  return toRemove.length;
 }
 
 /**
