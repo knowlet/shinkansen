@@ -195,6 +195,9 @@ export class RateLimiter {
    * 回傳 0 代表可以立即放行。
    */
   computeWaitMs(estTokens) {
+    if (estTokens > this.tpmCap) {
+      throw new RangeError("Estimated input tokens exceed the per-minute token limit.");
+    }
     const now = Date.now();
     this.pruneWindow(now);
 
