@@ -178,21 +178,29 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 const stickyTabs = new Map(); // tabId → slot (number)
 let _stickyHydrated = false;
+let _stickyHydrationPromise = null;
 
 async function hydrateStickyTabs() {
   if (_stickyHydrated) return;
-  _stickyHydrated = true;
-  try {
-    const { stickyTabs: saved } = await browser.storage.session.get('stickyTabs');
-    if (saved && typeof saved === 'object') {
-      for (const [tabId, slot] of Object.entries(saved)) {
-        // v1.4.12 前的舊值是 'gemini'/'google' 字串，重啟後忽略舊格式避免誤觸發
-        if (typeof slot === 'number') stickyTabs.set(Number(tabId), slot);
+  // Every startup reader/mutation must wait for the same saved-state snapshot.
+  if (!_stickyHydrationPromise) {
+    _stickyHydrationPromise = (async () => {
+      try {
+        const { stickyTabs: saved } = await browser.storage.session.get('stickyTabs');
+        if (saved && typeof saved === 'object') {
+          for (const [tabId, slot] of Object.entries(saved)) {
+            // v1.4.12 前的舊值是 'gemini'/'google' 字串，重啟後忽略舊格式避免誤觸發
+            if (typeof slot === 'number') stickyTabs.set(Number(tabId), slot);
+          }
+        }
+        _stickyHydrated = true;
+      } catch (err) {
+        debugLog('warn', 'system', 'hydrateStickyTabs failed', { error: err.message });
+        throw err;
       }
-    }
-  } catch (err) {
-    debugLog('warn', 'system', 'hydrateStickyTabs failed', { error: err.message });
+    })().finally(() => { _stickyHydrationPromise = null; });
   }
+  await _stickyHydrationPromise;
 }
 
 async function persistStickyTabs() {
@@ -206,7 +214,7 @@ async function persistStickyTabs() {
 }
 
 browser.tabs.onCreated.addListener(async (tab) => {
-  await hydrateStickyTabs();
+  try { await hydrateStickyTabs(); } catch { return; }
   const openerId = tab.openerTabId;
   if (openerId == null) return;
   const slot = stickyTabs.get(openerId);
@@ -219,6 +227,7 @@ browser.tabs.onCreated.addListener(async (tab) => {
 });
 
 browser.tabs.onRemoved.addListener(async (tabId) => {
+  try { await hydrateStickyTabs(); } catch { return; }
   if (!stickyTabs.has(tabId)) return;
   stickyTabs.delete(tabId);
   await persistStickyTabs();
