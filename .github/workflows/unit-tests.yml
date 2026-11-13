@@ -1,0 +1,38 @@
+name: Offline unit tests
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-unit-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install existing locked test dependencies without audit submission
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Check limiter and regression syntax
+        run: |
+          node --check shinkansen/lib/rate-limiter.js
+          node --check test/unit/rate-limiter-midnight.spec.js
+      - name: Run offline unit and Jest suites (no browser or live API)
+        run: |
+          npm run test:unit -- --workers=1
+          npm run test:jest -- --runInBand
