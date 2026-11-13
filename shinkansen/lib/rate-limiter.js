@@ -151,13 +151,15 @@ export class RateLimiter {
    * @returns {Promise<void>}
    */
   async acquire(estTokens, priority = 1) {
-    await this.loadRpdIfNeeded();
-
     // Inline 等待：自己 loop 直到 RPM/TPM 有 slot
     // 注意：RPD 不在此強制等待——RPD 只是軟性預算警告，
     // 真正的每日限額由 Gemini API 自己回傳 429 錯誤。
     let attempts = 0;
     while (true) {
+      await this.loadRpdIfNeeded();
+      // Storage reads or rollover persistence may themselves cross midnight.
+      // Retry before checking the slot; admission and accounting stay synchronous.
+      if (this.rpdDateKey !== getPacificDateKey()) continue;
       const waitMs = this.computeWaitMs(estTokens);
       if (waitMs <= 0) break;
 
