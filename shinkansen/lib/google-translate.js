@@ -44,8 +44,12 @@ export async function translateGoogleBatch(texts) {
   for (const group of groups) {
     const joined = group.map(g => g.text).join(SEP);
     const parts = await _fetchTranslate(joined);
+    // Never return/cache positional guesses when the separator was changed.
+    if (parts.length !== group.length) {
+      throw new Error(`Google Translate segment count mismatch: expected ${group.length}, received ${parts.length}`);
+    }
     group.forEach((g, j) => {
-      result[g.idx] = parts[j] ?? g.text; // 解析失敗時 fallback 原文
+      result[g.idx] = parts[j];
     });
   }
 
