@@ -108,17 +108,42 @@ test('tab removal during an existing read cannot resurrect a closed tab', async 
   expect(h.writes.at(-1)).toEqual({ stickyTabs: { 2: 2 } });
 });
 
-test('a failed read can be retried and successful hydration stays cached', async () => {
+test('one failed session read is retried immediately and successful hydration stays cached', async () => {
   const h = setup();
   const first = h.send('STICKY_QUERY', 1);
   h.reads[0].reject(new Error('temporary storage failure'));
-  expect(await first).toMatchObject({ ok: false, error: 'temporary storage failure' });
-  const retry = h.send('STICKY_QUERY', 1);
+  await flush();
   expect(h.reads).toHaveLength(2);
   h.reads[1].resolve({ stickyTabs: { 1: 3, 2: 'gemini' } });
-  expect(await retry).toMatchObject({ shouldTranslate: true, slot: 3 });
+  expect(await first).toMatchObject({ shouldTranslate: true, slot: 3 });
   expect(await h.send('STICKY_QUERY', 2)).toMatchObject({ shouldTranslate: false });
   expect(h.reads).toHaveLength(2);
+});
+
+test('two failed session reads fail the query and a later read can still hydrate', async () => {
+  const h = setup();
+  const first = h.send('STICKY_QUERY', 1);
+  h.reads[0].reject(new Error('temporary storage failure'));
+  await flush();
+  h.reads[1].reject(new Error('temporary storage failure'));
+  expect(await first).toMatchObject({ ok: false, error: 'temporary storage failure' });
+  const retry = h.send('STICKY_QUERY', 1);
+  await flush();
+  expect(h.reads).toHaveLength(3);
+  h.reads[2].resolve({ stickyTabs: { 1: 3, 2: 'gemini' } });
+  expect(await retry).toMatchObject({ shouldTranslate: true, slot: 3 });
+  expect(h.reads).toHaveLength(3);
+});
+
+test('a sticky write after hydration does not read session storage again', async () => {
+  const h = setup();
+  const first = h.send('STICKY_SET', 1, { slot: 1 });
+  h.reads[0].resolve({ stickyTabs: {} });
+  expect(await first).toMatchObject({ ok: true });
+  const second = h.send('STICKY_CLEAR', 1);
+  expect(await second).toMatchObject({ ok: true });
+  expect(h.reads).toHaveLength(1);
+  expect(h.writes.at(-1)).toEqual({ stickyTabs: {} });
 });
 
 test('tabs without openers do not inherit and unrelated removal preserves saved slots', async () => {
@@ -133,28 +158,67 @@ test('tabs without openers do not inherit and unrelated removal preserves saved 
 });
 
 for (const type of ['STICKY_SET', 'STICKY_CLEAR']) {
-  test(`${type} does not persist incomplete state after hydration failure`, async () => {
+  test(`${type} writes the merged snapshot after one transient session read failure`, async () => {
+    const h = setup();
+    const mutation = h.send(type, 1, { slot: 3 });
+    await flush();
+    expect(h.reads).toHaveLength(1);
+    expect(h.writes).toHaveLength(0);
+    h.reads[0].reject(new Error('temporary storage failure'));
+    await flush();
+    expect(h.reads).toHaveLength(2);
+    expect(h.writes).toHaveLength(0);
+    h.reads[1].resolve({ stickyTabs: { 1: 1, 2: 2 } });
+    expect(await mutation).toMatchObject({ ok: true });
+    expect(h.writes.at(-1)).toEqual({ stickyTabs: type === 'STICKY_SET' ? { 1: 3, 2: 2 } : { 2: 2 } });
+    expect(h.reads).toHaveLength(2);
+  });
+
+  test(`${type} does not persist incomplete state when the session read fails twice`, async () => {
     const h = setup();
     const mutation = h.send(type, 1, { slot: 3 });
     h.reads[0].reject(new Error('temporary storage failure'));
-    expect(await mutation).toMatchObject({ ok: false });
+    await flush();
+    h.reads[1].reject(new Error('temporary storage failure'));
+    expect(await mutation).toMatchObject({ ok: false, error: 'temporary storage failure' });
     expect(h.writes).toHaveLength(0);
     const retry = h.send(type, 1, { slot: 3 });
-    h.reads[1].resolve({ stickyTabs: { 1: 1, 2: 2 } });
+    await flush();
+    h.reads[2].resolve({ stickyTabs: { 1: 1, 2: 2 } });
     expect(await retry).toMatchObject({ ok: true });
     expect(h.writes.at(-1)).toEqual({ stickyTabs: type === 'STICKY_SET' ? { 1: 3, 2: 2 } : { 2: 2 } });
   });
 }
 
 for (const action of ['created', 'removed']) {
-  test(`${action} handles hydration failure without a write or unhandled rejection`, async () => {
+  test(`${action} proceeds after one transient read failure`, async () => {
+    const h = setup();
+    const pending = action === 'created' ? h.created({ id: 2, openerTabId: 1 }) : h.removed(1);
+    await flush();
+    h.reads[0].reject(new Error('temporary storage failure'));
+    await flush();
+    h.reads[1].resolve({ stickyTabs: { 1: 2 } });
+    await pending;
+    if (action === 'created') {
+      expect(h.writes.at(-1)).toEqual({ stickyTabs: { 1: 2, 2: 2 } });
+      expect(await h.send('STICKY_QUERY', 2)).toMatchObject({ shouldTranslate: true, slot: 2 });
+    } else {
+      expect(h.writes.at(-1)).toEqual({ stickyTabs: {} });
+      expect(await h.send('STICKY_QUERY', 1)).toMatchObject({ shouldTranslate: false });
+    }
+  });
+
+  test(`${action} handles two hydration failures without a write or unhandled rejection`, async () => {
     const h = setup();
     const pending = action === 'created' ? h.created({ id: 2, openerTabId: 1 }) : h.removed(1);
     h.reads[0].reject(new Error('temporary storage failure'));
+    await flush();
+    h.reads[1].reject(new Error('temporary storage failure'));
     await pending;
     expect(h.writes).toHaveLength(0);
     const query = h.send('STICKY_QUERY', 1);
-    h.reads[1].resolve({ stickyTabs: { 1: 2 } });
+    await flush();
+    h.reads[2].resolve({ stickyTabs: { 1: 2 } });
     expect(await query).toMatchObject({ slot: 2 });
   });
 }

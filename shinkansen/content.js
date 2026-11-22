@@ -371,6 +371,7 @@
     }
 
     STATE.translating = true;
+    stickyUiEpoch += 1;
     STATE.abortController = new AbortController();
     const translateStartTime = Date.now();
     const abortSignal = STATE.abortController.signal;
@@ -542,15 +543,14 @@
 
       STATE.translated = true;
       STATE.translatedBy = 'gemini';  // v1.4.0
-      STATE.stickyTranslate = true;
-      STATE.stickySlot = options.slot ?? null;  // v1.4.12: 記錄 preset slot 供 SPA 續翻 + 跨 tab 繼承
       browser.runtime.sendMessage({ type: 'SET_BADGE_TRANSLATED' }).catch(() => {});
-      // v1.4.11 跨 tab sticky（v1.4.12 改存 preset slot）：opener 鏈中新開的 tab 繼承同 slot
-      if (options.slot != null) {
-        browser.runtime.sendMessage({ type: 'STICKY_SET', payload: { slot: options.slot } }).catch(() => {});
-      }
+      // v1.4.11 跨 tab sticky（v1.4.12 改存 preset slot）：opener 鏈中新開的 tab 繼承同 slot。
+      // 背景回 ok:false（或通道失敗）時不能留著成功提示，並把續翻狀態收回。
+      const sticky = await commitStickySet(options.slot);
 
-      if (!failures.length) {
+      if (!sticky.stale && !sticky.ok) {
+        if (!failures.length) showStickyFailure('set', sticky.error);
+      } else if (!sticky.stale && !failures.length) {
         const totalTokens = pageUsage.inputTokens + pageUsage.outputTokens;
         const successMsg = truncatedCount > 0
           ? `翻譯完成 （${total} 段，另有 ${truncatedCount} 段因頁面過長被略過）`
@@ -635,10 +635,107 @@
     }
   };
 
+  // ─── sticky 命令結果 ─────────────────────────────────
+  // 背景的 STICKY_SET / STICKY_CLEAR 可能回 { ok:false }（session 讀寫失敗）。
+  // 舊路徑把 sendMessage 的結果丟掉，畫面仍顯示成功。這裡要看 ok，失敗就改錯誤提示，
+  // 並把已經樂觀改過的續翻／還原狀態收回。stickyUiEpoch 讓進行中的舊命令不要蓋掉
+  // 後續的翻譯或還原。
+
+  let stickyUiEpoch = 0;
+
+  async function sendStickyCommand(message) {
+    try {
+      const res = await browser.runtime.sendMessage(message);
+      if (!res || res.ok === false) {
+        return { ok: false, error: res?.error || 'sticky update failed' };
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  }
+
+  function showStickyFailure(action, error) {
+    const msg = action === 'set'
+      ? '跨分頁續翻未能儲存，此頁不會跟著開新分頁自動翻譯'
+      : action === 'reload'
+        ? '重新載入後未能清除跨分頁續翻'
+        : '跨分頁續翻未能清除，已恢復翻譯內容';
+    SK.showToast('error', msg, {
+      stopTimer: true,
+      autoHideMs: 4000,
+      ...(error ? { detail: error } : {}),
+    });
+  }
+
+  // slot 為 null 時只開本頁續翻，不寫背景。有 slot 才送 STICKY_SET。
+  async function commitStickySet(slot) {
+    const epoch = ++stickyUiEpoch;
+    STATE.stickyTranslate = true;
+    STATE.stickySlot = slot ?? null;
+    if (slot == null) return { ok: true };
+    const result = await sendStickyCommand({ type: 'STICKY_SET', payload: { slot } });
+    if (epoch !== stickyUiEpoch) return { ok: true, stale: true };
+    if (!result.ok) {
+      STATE.stickyTranslate = false;
+      STATE.stickySlot = null;
+    }
+    return result;
+  }
+
+  function captureStickySurface() {
+    const elements = new Map();
+    const remember = (el) => {
+      if (elements.has(el)) return;
+      elements.set(el, {
+        el,
+        html: el.innerHTML,
+        translatedAttr: el.getAttribute('data-shinkansen-translated'),
+        editable: el.getAttribute('contenteditable'),
+        editableClass: el.classList.contains('shinkansen-editable'),
+        hasOriginalHTML: STATE.originalHTML.has(el),
+        originalHTML: STATE.originalHTML.get(el),
+        hasTranslatedHTML: STATE.translatedHTML.has(el),
+        translatedHTML: STATE.translatedHTML.get(el),
+      });
+    };
+    for (const el of STATE.originalHTML.keys()) remember(el);
+    for (const el of STATE.translatedHTML.keys()) remember(el);
+    return {
+      translated: STATE.translated,
+      translatedBy: STATE.translatedBy,
+      stickyTranslate: STATE.stickyTranslate,
+      stickySlot: STATE.stickySlot,
+      elements: [...elements.values()],
+    };
+  }
+
+  function applyStickySurface(snapshot) {
+    STATE.originalHTML.clear();
+    STATE.translatedHTML.clear();
+    for (const item of snapshot.elements) {
+      item.el.innerHTML = item.html;
+      if (item.translatedAttr == null) item.el.removeAttribute('data-shinkansen-translated');
+      else item.el.setAttribute('data-shinkansen-translated', item.translatedAttr);
+      if (item.editable == null) item.el.removeAttribute('contenteditable');
+      else item.el.setAttribute('contenteditable', item.editable);
+      item.el.classList.toggle('shinkansen-editable', item.editableClass);
+      if (item.hasOriginalHTML) STATE.originalHTML.set(item.el, item.originalHTML);
+      if (item.hasTranslatedHTML) STATE.translatedHTML.set(item.el, item.translatedHTML);
+    }
+    STATE.translated = snapshot.translated;
+    STATE.translatedBy = snapshot.translatedBy;
+    STATE.stickyTranslate = snapshot.stickyTranslate;
+    STATE.stickySlot = snapshot.stickySlot;
+  }
+
   // ─── restorePage ─────────────────────────────────────
 
-  function restorePage() {
-    if (editModeActive) toggleEditMode(false);
+  async function restorePage() {
+    const epoch = ++stickyUiEpoch;
+    const wasEditing = editModeActive;
+    const snapshot = captureStickySurface();
+    if (wasEditing) toggleEditMode(false);
     SK.cancelRescan();
     SK.stopSpaObserver();
     STATE.originalHTML.forEach((originalHTML, el) => {
@@ -651,9 +748,16 @@
     STATE.translatedBy = null;  // v1.4.0
     STATE.stickyTranslate = false;
     STATE.stickySlot = null;    // v1.4.12
-    browser.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
     // v1.4.11: 清除跨 tab sticky（只影響當前 tab，不影響樹中其他 tab）
-    browser.runtime.sendMessage({ type: 'STICKY_CLEAR' }).catch(() => {});
+    const cleared = await sendStickyCommand({ type: 'STICKY_CLEAR' });
+    if (epoch !== stickyUiEpoch) return;
+    if (!cleared.ok) {
+      applyStickySurface(snapshot);
+      if (wasEditing) toggleEditMode(true);
+      showStickyFailure('clear', cleared.error);
+      return;
+    }
+    browser.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
     SK.showToast('success', '已還原原文', { progress: 1, autoHideMs: 2000 });
   }
 
@@ -778,6 +882,7 @@
     }
 
     STATE.translating = true;
+    stickyUiEpoch += 1;
     STATE.abortController = new AbortController();
     const translateStartTime = Date.now();
     const abortSignal = STATE.abortController.signal;
@@ -834,15 +939,13 @@
 
       STATE.translated = true;
       STATE.translatedBy = 'google';  // v1.4.0
-      STATE.stickyTranslate = true;
-      STATE.stickySlot = gtOptions.slot ?? null;  // v1.4.12
       browser.runtime.sendMessage({ type: 'SET_BADGE_TRANSLATED' }).catch(() => {});
       // v1.4.11 跨 tab sticky（v1.4.12 改存 preset slot）：opener 鏈中新開的 tab 繼承同 slot
-      if (gtOptions.slot != null) {
-        browser.runtime.sendMessage({ type: 'STICKY_SET', payload: { slot: gtOptions.slot } }).catch(() => {});
-      }
+      const sticky = await commitStickySet(gtOptions.slot);
 
-      if (!failures.length) {
+      if (!sticky.stale && !sticky.ok) {
+        if (!failures.length) showStickyFailure('set', sticky.error);
+      } else if (!sticky.stale && !failures.length) {
         const successMsg = truncatedCount > 0
           ? `Google 翻譯完成（${total} 段，另有 ${truncatedCount} 段因頁面過長被略過）`
           : `Google 翻譯完成（${total} 段）`;
@@ -1074,6 +1177,7 @@
         translated: STATE.translated,
         translating: STATE.translating,
         stickyTranslate: STATE.stickyTranslate,
+        stickySlot: STATE.stickySlot,
         replacedCount: STATE.originalHTML.size,
         cacheSize: STATE.cache.size,
         guardCacheSize: STATE.translatedHTML.size,
@@ -1082,6 +1186,7 @@
     setTestState(overrides) {
       if ('translated' in overrides) STATE.translated = !!overrides.translated;
       if ('stickyTranslate' in overrides) STATE.stickyTranslate = !!overrides.stickyTranslate;
+      if ('stickySlot' in overrides) STATE.stickySlot = overrides.stickySlot == null ? null : overrides.stickySlot;
     },
     testRunContentGuard() {
       return SK.testRunContentGuard();
@@ -1139,8 +1244,15 @@
         navType = performance.getEntriesByType('navigation')?.[0]?.type || null;
       } catch { /* 舊環境不支援，視為 navigate */ }
       if (navType === 'reload') {
-        await browser.runtime.sendMessage({ type: 'STICKY_CLEAR' }).catch(() => {});
-        SK.sendLog('info', 'system', 'page reload, sticky cleared', { navType, url: location.href });
+        const cleared = await sendStickyCommand({ type: 'STICKY_CLEAR' });
+        if (cleared.ok) {
+          SK.sendLog('info', 'system', 'page reload, sticky cleared', { navType, url: location.href });
+        } else {
+          SK.sendLog('warn', 'system', 'page reload, sticky clear failed', {
+            navType, url: location.href, error: cleared.error,
+          });
+          showStickyFailure('reload', cleared.error);
+        }
       } else {
         // v1.4.11 跨 tab sticky（v1.4.12 改傳 preset slot）：opener tab 的 preset 延用到此 tab
         const stickyResp = await browser.runtime.sendMessage({ type: 'STICKY_QUERY' }).catch(() => null);

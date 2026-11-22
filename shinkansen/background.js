@@ -180,13 +180,30 @@ const stickyTabs = new Map(); // tabId → slot (number)
 let _stickyHydrated = false;
 let _stickyHydrationPromise = null;
 
+// The saved map is required only while this worker has not loaded it. A later
+// mutation persists the in-memory map and does not read again. While the map
+// is still unknown, one transient get() failure is retried immediately — no
+// delay — so SET/CLEAR can still merge and write. A second failure still
+// refuses the write; persisting the empty map would erase saved tabs.
+async function readStickySession() {
+  try {
+    return await browser.storage.session.get('stickyTabs');
+  } catch (err) {
+    debugLog('warn', 'system', 'sticky session read failed, retrying once', {
+      error: err?.message || String(err),
+    });
+    return browser.storage.session.get('stickyTabs');
+  }
+}
+
 async function hydrateStickyTabs() {
   if (_stickyHydrated) return;
   // Every startup reader/mutation must wait for the same saved-state snapshot.
   if (!_stickyHydrationPromise) {
     _stickyHydrationPromise = (async () => {
       try {
-        const { stickyTabs: saved } = await browser.storage.session.get('stickyTabs');
+        const stored = await readStickySession();
+        const saved = stored?.stickyTabs;
         if (saved && typeof saved === 'object') {
           for (const [tabId, slot] of Object.entries(saved)) {
             // v1.4.12 前的舊值是 'gemini'/'google' 字串，重啟後忽略舊格式避免誤觸發
@@ -195,7 +212,7 @@ async function hydrateStickyTabs() {
         }
         _stickyHydrated = true;
       } catch (err) {
-        debugLog('warn', 'system', 'hydrateStickyTabs failed', { error: err.message });
+        debugLog('warn', 'system', 'hydrateStickyTabs failed', { error: err?.message || String(err) });
         throw err;
       }
     })().finally(() => { _stickyHydrationPromise = null; });
