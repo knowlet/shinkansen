@@ -273,6 +273,86 @@ describe('sticky command failure is shown and reverted', () => {
     expect(env.window.__SK.isSpaObserverActive()).toBe(false);
   });
 
+  test('switching to Google waits for sticky clear and keeps the page when it fails', async () => {
+    env = createEnv();
+    const p = addParagraph(env);
+    env.shinkansen.testInject(p, '你好世界，這是一段僅用於測試的長段落。');
+    env.shinkansen.setTestState({ translated: true, stickyTranslate: true, stickySlot: 1 });
+    const translatedHTML = p.innerHTML;
+    let googleCalls = 0;
+    env.window.__SK.translateUnitsGoogle = async () => {
+      googleCalls += 1;
+      return { done: 1, failures: [], chars: 4 };
+    };
+    env.chrome.runtime.sendMessage.mockImplementation((msg) => {
+      if (msg?.type === 'STICKY_CLEAR') {
+        return Promise.resolve({ ok: false, error: 'temporary storage failure' });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const toasts = watchToasts(env.window);
+
+    await env.window.__SK.translatePageGoogle({ slot: 3 });
+
+    expect(googleCalls).toBe(0);
+    expect(env.shinkansen.getState().translated).toBe(true);
+    expect(p.innerHTML).toBe(translatedHTML);
+    expect(toasts.some(t => t.kind === 'error' && t.msg.includes('已恢復翻譯內容'))).toBe(true);
+    expect(toasts.some(t => t.kind === 'success' && String(t.msg).includes('Google 翻譯完成'))).toBe(false);
+  });
+
+  test('failed clear during an in-flight rescan schedules the rescan again', async () => {
+    env = createEnv();
+    const p = addParagraph(env);
+    stubGemini(env, p);
+    env.window.__SK.RESCAN_DELAYS_MS = [0, 60_000];
+    let calls = 0;
+    let releaseRescan;
+    env.window.__SK.translateUnits = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return { done: 1, failures: [], pageUsage, rpdWarning: false };
+      }
+      if (calls === 2) {
+        return new Promise((resolve) => {
+          releaseRescan = () => resolve({ done: 0, failures: [] });
+        });
+      }
+      return { done: 0, failures: [] };
+    };
+    let finishClear;
+    env.chrome.runtime.sendMessage.mockImplementation((msg) => {
+      if (msg?.type === 'STICKY_SET') return Promise.resolve({ ok: true });
+      if (msg?.type === 'STICKY_CLEAR') {
+        return new Promise((resolve) => {
+          finishClear = () => resolve({ ok: false, error: 'temporary storage failure' });
+        });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const toasts = watchToasts(env.window);
+
+    await env.window.__SK.translatePage({ slot: 1 });
+    const rescanStarted = await waitForCondition(() => calls === 2 && typeof releaseRescan === 'function');
+    expect(rescanStarted).toBe(true);
+
+    restoreViaDebug(env);
+    const clearPending = await waitForCondition(() => typeof finishClear === 'function');
+    expect(clearPending).toBe(true);
+    releaseRescan();
+    await new Promise(r => setImmediate(r));
+    const callsAfterBail = calls;
+
+    finishClear();
+    const shown = await waitForCondition(() => toasts.some(
+      t => t.kind === 'error' && t.msg.includes('已恢復翻譯內容'),
+    ));
+    expect(shown).toBe(true);
+    const restarted = await waitForCondition(() => calls > callsAfterBail);
+    expect(restarted).toBe(true);
+    expect(env.shinkansen.getState().translated).toBe(true);
+  });
+
   test('reload STICKY_CLEAR ok:false shows an error instead of a cleared log', async () => {
     const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', {
       url: 'https://example.com/reloaded',

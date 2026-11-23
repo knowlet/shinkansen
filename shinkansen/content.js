@@ -97,6 +97,10 @@
 
   let rescanAttempts = 0;
   let rescanTimer = null;
+  // rescanTick clears rescanTimer before it awaits, so the timer alone does
+  // not mean a rescan sequence is still running.
+  let rescanActive = false;
+  let rescanGeneration = 0;
 
   SK.cancelRescan = function cancelRescan() {
     if (rescanTimer) {
@@ -104,21 +108,25 @@
       rescanTimer = null;
     }
     rescanAttempts = 0;
+    rescanActive = false;
+    rescanGeneration += 1;
   };
 
   function scheduleRescanForLateContent() {
     SK.cancelRescan();
-    rescanTimer = setTimeout(rescanTick, SK.RESCAN_DELAYS_MS[0]);
+    rescanActive = true;
+    const generation = rescanGeneration;
+    rescanTimer = setTimeout(() => { rescanTick(generation); }, SK.RESCAN_DELAYS_MS[0]);
   }
 
-  async function rescanTick() {
+  async function rescanTick(generation) {
     rescanTimer = null;
-    if (!STATE.translated) return;
+    if (generation !== rescanGeneration || !STATE.translated) return;
     const newUnits = SK.collectParagraphs();
     if (newUnits.length > 0) {
       try {
         const { done, failures } = await SK.translateUnits(newUnits);
-        if (!STATE.translated) return;
+        if (generation !== rescanGeneration || !STATE.translated) return;
         if (done > 0) {
           SK.sendLog('info', 'translate', 'rescan caught new units', { done, failures: failures.length, attempt: rescanAttempts + 1 });
         }
@@ -126,9 +134,12 @@
         SK.sendLog('warn', 'translate', 'rescan failed', { error: err.message });
       }
     }
+    if (generation !== rescanGeneration) return;
     rescanAttempts += 1;
     if (rescanAttempts < SK.RESCAN_DELAYS_MS.length) {
-      rescanTimer = setTimeout(rescanTick, SK.RESCAN_DELAYS_MS[rescanAttempts]);
+      rescanTimer = setTimeout(() => { rescanTick(generation); }, SK.RESCAN_DELAYS_MS[rescanAttempts]);
+    } else {
+      rescanActive = false;
     }
   }
 
@@ -742,7 +753,7 @@
     const epoch = ++stickyUiEpoch;
     const wasEditing = editModeActive;
     const snapshot = captureStickySurface();
-    const rescanWasPending = rescanTimer != null;
+    const rescanWasActive = rescanActive;
     const observerWasActive = SK.isSpaObserverActive();
     if (wasEditing) toggleEditMode(false);
     SK.cancelRescan();
@@ -765,7 +776,7 @@
       if (wasEditing) toggleEditMode(true);
       // The translated page is back, so the late-content rescan and the SPA
       // observer/content guard that were running must run again too.
-      if (rescanWasPending) scheduleRescanForLateContent();
+      if (rescanWasActive) scheduleRescanForLateContent();
       if (observerWasActive) SK.startSpaObserver();
       showStickyFailure('clear', cleared.error);
       return { ok: false, error: cleared.error };
@@ -866,14 +877,17 @@
       return;
     }
 
-    // 若 Gemini 翻譯已完成 → 先還原，再用 Google 翻
-    if (STATE.translated) {
-      restorePage();
-    }
-
     if (!navigator.onLine) {
       SK.showToast('error', '目前處於離線狀態，無法翻譯。請確認網路連線後再試', { autoHideMs: 5000 });
       return;
+    }
+
+    // 若 Gemini 翻譯已完成 → 先等還原完成，再用 Google 翻。
+    // 不能在還原的 STICKY_CLEAR 結束前推進 stickyUiEpoch，否則清除失敗時
+    // 畫面已被清掉、錯誤被當成過期命令丟掉，Google 翻譯仍會開始。
+    if (STATE.translated) {
+      const restored = await restorePage();
+      if (!restored?.ok) return;
     }
 
     // 繁中偵測（與 Gemini 相同邏輯）
@@ -896,7 +910,6 @@
     }
 
     STATE.translating = true;
-    stickyUiEpoch += 1;
     STATE.abortController = new AbortController();
     const translateStartTime = Date.now();
     const abortSignal = STATE.abortController.signal;
@@ -908,6 +921,8 @@
       STATE.abortController = null;
       return;
     }
+    // 確定這次翻譯會繼續，才讓進行中的舊命令變成過期。
+    stickyUiEpoch += 1;
 
     // 超大頁面防護（沿用相同上限設定）
     let maxTotalUnits = SK.DEFAULT_MAX_TOTAL_UNITS;

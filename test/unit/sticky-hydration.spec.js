@@ -269,6 +269,61 @@ test('a failed write is not persisted by a concurrent write for another tab', as
   expect(h.writes.at(-1)).toEqual({ stickyTabs: { 1: 1, 2: 4 } });
 });
 
+test('a new tab does not copy a preset whose save fails', async () => {
+  const h = setup({ gateWrites: true });
+  const set = h.send('STICKY_SET', 1, { slot: 3 });
+  await flush();
+  h.reads[0].resolve({ stickyTabs: {} });
+  await flush();
+  expect(h.pendingWrites).toHaveLength(1);
+  const child = h.created({ id: 2, openerTabId: 1 });
+  h.pendingWrites[0].gate.reject(new Error('quota exceeded'));
+  expect(await set).toMatchObject({ ok: false, error: 'quota exceeded' });
+  await child;
+  expect(h.writes).toHaveLength(0);
+  expect(h.pendingWrites).toHaveLength(1);
+  expect(await h.send('STICKY_QUERY', 1)).toMatchObject({ shouldTranslate: false });
+  expect(await h.send('STICKY_QUERY', 2)).toMatchObject({ shouldTranslate: false });
+});
+
+test('a new tab inherits a preset only after that save commits', async () => {
+  const h = setup({ gateWrites: true });
+  const set = h.send('STICKY_SET', 1, { slot: 3 });
+  await flush();
+  h.reads[0].resolve({ stickyTabs: { 9: 1 } });
+  await flush();
+  const child = h.created({ id: 2, openerTabId: 1 });
+  h.pendingWrites[0].gate.resolve();
+  expect(await set).toMatchObject({ ok: true });
+  await flush();
+  expect(h.pendingWrites[1].value).toEqual({ stickyTabs: { 1: 3, 2: 3, 9: 1 } });
+  h.pendingWrites[1].gate.resolve();
+  await child;
+  expect(await h.send('STICKY_QUERY', 2)).toMatchObject({ shouldTranslate: true, slot: 3 });
+});
+
+test('closing a tab drops a preset that has not been applied yet', async () => {
+  const h = setup();
+  const set = h.send('STICKY_SET', 1, { slot: 3 });
+  const removal = h.removed(1);
+  await flush();
+  h.reads[0].resolve({ stickyTabs: {} });
+  expect(await set).toMatchObject({ ok: false, error: 'tab closed' });
+  await removal;
+  expect(h.writes).toHaveLength(0);
+  expect(await h.send('STICKY_QUERY', 1)).toMatchObject({ shouldTranslate: false });
+});
+
+test('a preset set after the tab closed is not saved', async () => {
+  const h = setup();
+  const removal = h.removed(1);
+  h.reads[0].resolve({ stickyTabs: {} });
+  await removal;
+  const set = h.send('STICKY_SET', 1, { slot: 3 });
+  expect(await set).toMatchObject({ ok: false, error: 'tab closed' });
+  expect(h.writes).toHaveLength(0);
+});
+
 test('rolling back a failed write keeps a newer successful value for the same tab', async () => {
   const h = setup({ gateWrites: true });
   const first = h.send('STICKY_SET', 1, { slot: 3 });

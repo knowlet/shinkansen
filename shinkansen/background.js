@@ -243,12 +243,21 @@ async function persistStickyTabs() {
 // Otherwise its snapshot could persist the first change after that change was
 // reported as failed, and a rollback could erase a newer successful value.
 let _stickyCommitChain = Promise.resolve();
+const closedStickyTabs = new Set();
+
 function commitStickyChange(tabId, slot) {
   const apply = async () => {
+    if (slot != null && closedStickyTabs.has(tabId)) {
+      return { ok: false, error: 'tab closed' };
+    }
     const had = stickyTabs.has(tabId);
     const previous = stickyTabs.get(tabId);
-    if (slot == null) stickyTabs.delete(tabId);
-    else stickyTabs.set(tabId, slot);
+    if (slot == null) {
+      if (!had) return { ok: true };
+      stickyTabs.delete(tabId);
+    } else {
+      stickyTabs.set(tabId, slot);
+    }
     const saved = await persistStickyTabs();
     if (!saved.ok) {
       if (had) stickyTabs.set(tabId, previous);
@@ -261,8 +270,21 @@ function commitStickyChange(tabId, slot) {
   return result;
 }
 
+// Inheritance must observe a save that has finished. The map holds a preset
+// that is still being written; reading it there copies a value that may be
+// rolled back. Wait until the chain is idle, then read.
+async function waitForStickyCommits() {
+  let pending = _stickyCommitChain;
+  for (;;) {
+    await pending;
+    if (pending === _stickyCommitChain) return;
+    pending = _stickyCommitChain;
+  }
+}
+
 browser.tabs.onCreated.addListener(async (tab) => {
   try { await hydrateStickyTabs(); } catch { return; }
+  await waitForStickyCommits();
   const openerId = tab.openerTabId;
   if (openerId == null) return;
   const slot = stickyTabs.get(openerId);
@@ -275,8 +297,10 @@ browser.tabs.onCreated.addListener(async (tab) => {
 });
 
 browser.tabs.onRemoved.addListener(async (tabId) => {
+  // Record the close before any await. A SET queued behind hydration has not
+  // touched the map yet; bailing on !has would let that SET save a closed tab.
+  closedStickyTabs.add(tabId);
   try { await hydrateStickyTabs(); } catch { return; }
-  if (!stickyTabs.has(tabId)) return;
   await commitStickyChange(tabId, null);
 });
 
