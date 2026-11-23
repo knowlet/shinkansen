@@ -162,6 +162,7 @@
     spaObserverSeenTexts.clear();
   }
   SK.stopSpaObserver = stopSpaObserver;
+  SK.isSpaObserverActive = () => spaObserver != null;
 
   // ─── Content Guard ────────────────────────────────────
 

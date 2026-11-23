@@ -200,6 +200,79 @@ describe('sticky command failure is shown and reverted', () => {
     expect(toasts.some(t => t.kind === 'error' && t.msg.includes('未能儲存'))).toBe(false);
   });
 
+  test('failed STICKY_CLEAR restarts the SPA observer and late-content rescan it stopped', async () => {
+    env = createEnv();
+    const p = addParagraph(env);
+    env.shinkansen.testInject(p, '你好世界，這是一段僅用於測試的長段落。');
+    env.shinkansen.setTestState({ translated: true, stickyTranslate: true, stickySlot: 2 });
+    env.window.__SK.startSpaObserver();
+    expect(env.window.__SK.isSpaObserverActive()).toBe(true);
+
+    env.chrome.runtime.sendMessage.mockImplementation((msg) => {
+      if (msg?.type === 'STICKY_CLEAR') {
+        return Promise.resolve({ ok: false, error: 'temporary storage failure' });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const toasts = watchToasts(env.window);
+    restoreViaDebug(env);
+
+    const shown = await waitForCondition(() => toasts.some(t => t.kind === 'error'));
+    expect(shown).toBe(true);
+    expect(env.shinkansen.getState().translated).toBe(true);
+    expect(env.window.__SK.isSpaObserverActive()).toBe(true);
+    env.window.__SK.stopSpaObserver();
+  });
+
+  test('RESTORE debug command reports a failed STICKY_CLEAR instead of success', async () => {
+    env = createEnv();
+    const p = addParagraph(env);
+    env.shinkansen.testInject(p, '你好世界，這是一段僅用於測試的長段落。');
+    env.shinkansen.setTestState({ translated: true, stickyTranslate: true, stickySlot: 2 });
+    env.chrome.runtime.sendMessage.mockImplementation((msg) => {
+      if (msg?.type === 'STICKY_CLEAR') {
+        return Promise.resolve({ ok: false, error: 'temporary storage failure' });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const responses = [];
+    env.window.addEventListener('shinkansen-debug-response', (e) => responses.push(e.detail));
+    restoreViaDebug(env);
+
+    const answered = await waitForCondition(() => responses.length > 0);
+    expect(answered).toBe(true);
+    expect(responses[0]).toMatchObject({ ok: false, error: 'temporary storage failure' });
+    expect(env.shinkansen.getState().translated).toBe(true);
+  });
+
+  test('restore during a pending STICKY_SET does not restart the SPA observer', async () => {
+    env = createEnv();
+    const p = addParagraph(env);
+    stubGemini(env, p);
+    let finishSet;
+    env.chrome.runtime.sendMessage.mockImplementation((msg) => {
+      if (msg?.type === 'STICKY_SET') {
+        return new Promise((resolve) => { finishSet = () => resolve({ ok: true }); });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const toasts = watchToasts(env.window);
+
+    const translating = env.window.__SK.translatePage({ slot: 1 });
+    const pending = await waitForCondition(() => typeof finishSet === 'function');
+    expect(pending).toBe(true);
+    restoreViaDebug(env);
+    const restored = await waitForCondition(() => toasts.some(
+      t => t.kind === 'success' && t.msg === '已還原原文',
+    ));
+    expect(restored).toBe(true);
+
+    finishSet();
+    await translating;
+    expect(env.shinkansen.getState().translated).toBe(false);
+    expect(env.window.__SK.isSpaObserverActive()).toBe(false);
+  });
+
   test('reload STICKY_CLEAR ok:false shows an error instead of a cleared log', async () => {
     const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', {
       url: 'https://example.com/reloaded',

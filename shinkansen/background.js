@@ -220,14 +220,35 @@ async function hydrateStickyTabs() {
   await _stickyHydrationPromise;
 }
 
+// Returns { ok, error }. A rejected write is reported to the caller instead of
+// being treated as saved.
 async function persistStickyTabs() {
   try {
     const obj = {};
     stickyTabs.forEach((slot, tabId) => { obj[tabId] = slot; });
     await browser.storage.session.set({ stickyTabs: obj });
+    return { ok: true };
   } catch (err) {
-    debugLog('warn', 'system', 'persistStickyTabs failed', { error: err.message });
+    const error = err?.message || String(err);
+    debugLog('warn', 'system', 'persistStickyTabs failed', { error });
+    return { ok: false, error };
   }
+}
+
+// Apply one tab change and persist it. When the write is rejected the
+// in-memory map goes back to the last successfully written value, so a later
+// write cannot save a change the caller was told had failed.
+async function commitStickyChange(tabId, slot) {
+  const had = stickyTabs.has(tabId);
+  const previous = stickyTabs.get(tabId);
+  if (slot == null) stickyTabs.delete(tabId);
+  else stickyTabs.set(tabId, slot);
+  const saved = await persistStickyTabs();
+  if (!saved.ok) {
+    if (had) stickyTabs.set(tabId, previous);
+    else stickyTabs.delete(tabId);
+  }
+  return saved;
 }
 
 browser.tabs.onCreated.addListener(async (tab) => {
@@ -236,8 +257,8 @@ browser.tabs.onCreated.addListener(async (tab) => {
   if (openerId == null) return;
   const slot = stickyTabs.get(openerId);
   if (slot == null) return;
-  stickyTabs.set(tab.id, slot);
-  await persistStickyTabs();
+  const saved = await commitStickyChange(tab.id, slot);
+  if (!saved.ok) return;
   debugLog('info', 'system', 'sticky inherited from opener', {
     newTabId: tab.id, openerTabId: openerId, slot,
   });
@@ -246,8 +267,7 @@ browser.tabs.onCreated.addListener(async (tab) => {
 browser.tabs.onRemoved.addListener(async (tabId) => {
   try { await hydrateStickyTabs(); } catch { return; }
   if (!stickyTabs.has(tabId)) return;
-  stickyTabs.delete(tabId);
-  await persistStickyTabs();
+  await commitStickyChange(tabId, null);
 });
 
 // ─── 訊息路由（handler map 取代 if-else 鏈） ──────────────────
@@ -345,9 +365,7 @@ const messageHandlers = {
       if (tabId == null) return { ok: false, error: 'no tab id' };
       const slot = Number(payload?.slot);
       if (!Number.isInteger(slot) || slot < 1) return { ok: false, error: 'invalid slot' };
-      stickyTabs.set(tabId, slot);
-      await persistStickyTabs();
-      return { ok: true };
+      return commitStickyChange(tabId, slot);
     },
   },
   STICKY_CLEAR: {
@@ -356,9 +374,7 @@ const messageHandlers = {
       await hydrateStickyTabs();
       const tabId = sender?.tab?.id;
       if (tabId == null) return { ok: false };
-      stickyTabs.delete(tabId);
-      await persistStickyTabs();
-      return { ok: true };
+      return commitStickyChange(tabId, null);
     },
   },
   LOG: {

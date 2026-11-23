@@ -33,8 +33,11 @@
       SK.translatePage();
     } else if (action === 'RESTORE') {
       if (STATE.translated) {
-        restorePage();
-        respond({ ok: true, restored: true });
+        restorePage().then((outcome) => {
+          respond(outcome.ok
+            ? { ok: true, restored: true }
+            : { ok: false, restored: false, error: outcome.error || 'restore failed' });
+        });
       } else {
         respond({ ok: false, error: 'not translated' });
       }
@@ -622,8 +625,12 @@
         }, 1500);
       }
 
-      scheduleRescanForLateContent();
-      SK.startSpaObserver();
+      // A restore (or a newer translation) that ran while SET was pending
+      // owns the page now; do not restart services it stopped.
+      if (!sticky.stale) {
+        scheduleRescanForLateContent();
+        SK.startSpaObserver();
+      }
     } catch (err) {
       SK.sendLog('error', 'translate', 'translatePage error', { error: err.message || String(err) });
       if (!abortSignal.aborted) {
@@ -735,6 +742,8 @@
     const epoch = ++stickyUiEpoch;
     const wasEditing = editModeActive;
     const snapshot = captureStickySurface();
+    const rescanWasPending = rescanTimer != null;
+    const observerWasActive = SK.isSpaObserverActive();
     if (wasEditing) toggleEditMode(false);
     SK.cancelRescan();
     SK.stopSpaObserver();
@@ -750,15 +759,20 @@
     STATE.stickySlot = null;    // v1.4.12
     // v1.4.11: 清除跨 tab sticky（只影響當前 tab，不影響樹中其他 tab）
     const cleared = await sendStickyCommand({ type: 'STICKY_CLEAR' });
-    if (epoch !== stickyUiEpoch) return;
+    if (epoch !== stickyUiEpoch) return { ok: false, stale: true, error: 'superseded' };
     if (!cleared.ok) {
       applyStickySurface(snapshot);
       if (wasEditing) toggleEditMode(true);
+      // The translated page is back, so the late-content rescan and the SPA
+      // observer/content guard that were running must run again too.
+      if (rescanWasPending) scheduleRescanForLateContent();
+      if (observerWasActive) SK.startSpaObserver();
       showStickyFailure('clear', cleared.error);
-      return;
+      return { ok: false, error: cleared.error };
     }
     browser.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
     SK.showToast('success', '已還原原文', { progress: 1, autoHideMs: 2000 });
+    return { ok: true };
   }
 
   // ─── v1.4.0: Google Translate 批次送出 ──────────────────────
@@ -961,8 +975,12 @@
         segments: total, chars, elapsed: Date.now() - translateStartTime, url: location.href,
       });
 
-      scheduleRescanForLateContent();
-      SK.startSpaObserver();
+      // A restore (or a newer translation) that ran while SET was pending
+      // owns the page now; do not restart services it stopped.
+      if (!sticky.stale) {
+        scheduleRescanForLateContent();
+        SK.startSpaObserver();
+      }
     } catch (err) {
       SK.sendLog('error', 'translate', 'translatePageGoogle error', { error: err.message || String(err) });
       if (!abortSignal.aborted) {
