@@ -245,6 +245,51 @@ describe('sticky command failure is shown and reverted', () => {
     expect(env.shinkansen.getState().translated).toBe(true);
   });
 
+  test('failed clear during a pending STICKY_SET starts the rescan and SPA observer', async () => {
+    env = createEnv();
+    const p = addParagraph(env);
+    stubGemini(env, p);
+    env.window.__SK.RESCAN_DELAYS_MS = [0, 60_000];
+    let calls = 0;
+    env.window.__SK.translateUnits = async () => {
+      calls += 1;
+      return { done: calls === 1 ? 1 : 0, failures: [], pageUsage, rpdWarning: false };
+    };
+    let finishSet;
+    env.chrome.runtime.sendMessage.mockImplementation((msg) => {
+      if (msg?.type === 'STICKY_SET') {
+        return new Promise((resolve) => { finishSet = () => resolve({ ok: true }); });
+      }
+      if (msg?.type === 'STICKY_CLEAR') {
+        return Promise.resolve({ ok: false, error: 'temporary storage failure' });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const toasts = watchToasts(env.window);
+
+    const translating = env.window.__SK.translatePage({ slot: 1 });
+    const pending = await waitForCondition(() => typeof finishSet === 'function');
+    expect(pending).toBe(true);
+    expect(env.window.__SK.isSpaObserverActive()).toBe(false);
+
+    restoreViaDebug(env);
+    const shown = await waitForCondition(() => toasts.some(
+      t => t.kind === 'error' && t.msg.includes('已恢復翻譯內容'),
+    ));
+    expect(shown).toBe(true);
+    expect(env.window.__SK.isSpaObserverActive()).toBe(true);
+    const rescanned = await waitForCondition(() => calls >= 2);
+    expect(rescanned).toBe(true);
+    expect(env.shinkansen.getState().translated).toBe(true);
+
+    finishSet();
+    await translating;
+    expect(env.shinkansen.getState().translated).toBe(true);
+    expect(env.window.__SK.isSpaObserverActive()).toBe(true);
+    env.window.__SK.stopSpaObserver();
+    env.window.__SK.cancelRescan();
+  });
+
   test('restore during a pending STICKY_SET does not restart the SPA observer', async () => {
     env = createEnv();
     const p = addParagraph(env);

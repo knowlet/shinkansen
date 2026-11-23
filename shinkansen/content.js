@@ -560,6 +560,7 @@
       browser.runtime.sendMessage({ type: 'SET_BADGE_TRANSLATED' }).catch(() => {});
       // v1.4.11 跨 tab sticky（v1.4.12 改存 preset slot）：opener 鏈中新開的 tab 繼承同 slot。
       // 背景回 ok:false（或通道失敗）時不能留著成功提示，並把續翻狀態收回。
+      stickyServicesWanted = true;
       const sticky = await commitStickySet(options.slot);
 
       if (!sticky.stale && !sticky.ok) {
@@ -637,7 +638,9 @@
       }
 
       // A restore (or a newer translation) that ran while SET was pending
-      // owns the page now; do not restart services it stopped.
+      // owns the page now; do not restart services it stopped. A failed clear
+      // already started them from stickyServicesWanted.
+      stickyServicesWanted = false;
       if (!sticky.stale) {
         scheduleRescanForLateContent();
         SK.startSpaObserver();
@@ -660,6 +663,10 @@
   // 後續的翻譯或還原。
 
   let stickyUiEpoch = 0;
+  // Set while a finished translation is waiting on STICKY_SET before it starts
+  // the rescan and SPA observer. A restore in that window must keep the intent
+  // and start them if CLEAR fails and the translated page comes back.
+  let stickyServicesWanted = false;
 
   async function sendStickyCommand(message) {
     try {
@@ -755,6 +762,7 @@
     const snapshot = captureStickySurface();
     const rescanWasActive = rescanActive;
     const observerWasActive = SK.isSpaObserverActive();
+    const servicesWanted = stickyServicesWanted;
     if (wasEditing) toggleEditMode(false);
     SK.cancelRescan();
     SK.stopSpaObserver();
@@ -776,11 +784,13 @@
       if (wasEditing) toggleEditMode(true);
       // The translated page is back, so the late-content rescan and the SPA
       // observer/content guard that were running must run again too.
-      if (rescanWasActive) scheduleRescanForLateContent();
-      if (observerWasActive) SK.startSpaObserver();
+      if (rescanWasActive || servicesWanted) scheduleRescanForLateContent();
+      if (observerWasActive || servicesWanted) SK.startSpaObserver();
+      stickyServicesWanted = false;
       showStickyFailure('clear', cleared.error);
       return { ok: false, error: cleared.error };
     }
+    stickyServicesWanted = false;
     browser.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
     SK.showToast('success', '已還原原文', { progress: 1, autoHideMs: 2000 });
     return { ok: true };
@@ -970,6 +980,7 @@
       STATE.translatedBy = 'google';  // v1.4.0
       browser.runtime.sendMessage({ type: 'SET_BADGE_TRANSLATED' }).catch(() => {});
       // v1.4.11 跨 tab sticky（v1.4.12 改存 preset slot）：opener 鏈中新開的 tab 繼承同 slot
+      stickyServicesWanted = true;
       const sticky = await commitStickySet(gtOptions.slot);
 
       if (!sticky.stale && !sticky.ok) {
@@ -991,7 +1002,9 @@
       });
 
       // A restore (or a newer translation) that ran while SET was pending
-      // owns the page now; do not restart services it stopped.
+      // owns the page now; do not restart services it stopped. A failed clear
+      // already started them from stickyServicesWanted.
+      stickyServicesWanted = false;
       if (!sticky.stale) {
         scheduleRescanForLateContent();
         SK.startSpaObserver();

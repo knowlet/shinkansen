@@ -243,56 +243,70 @@ async function persistStickyTabs() {
 // Otherwise its snapshot could persist the first change after that change was
 // reported as failed, and a rollback could erase a newer successful value.
 let _stickyCommitChain = Promise.resolve();
+let _stickyQueueDepth = 0;
 const closedStickyTabs = new Set();
 
-function commitStickyChange(tabId, slot) {
-  const apply = async () => {
-    if (slot != null && closedStickyTabs.has(tabId)) {
-      return { ok: false, error: 'tab closed' };
-    }
-    const had = stickyTabs.has(tabId);
-    const previous = stickyTabs.get(tabId);
-    if (slot == null) {
-      if (!had) return { ok: true };
-      stickyTabs.delete(tabId);
-    } else {
-      stickyTabs.set(tabId, slot);
-    }
-    const saved = await persistStickyTabs();
-    if (!saved.ok) {
-      if (had) stickyTabs.set(tabId, previous);
-      else stickyTabs.delete(tabId);
-    }
-    return saved;
+function enqueueSticky(apply) {
+  _stickyQueueDepth += 1;
+  const run = () => {
+    let result;
+    try { result = Promise.resolve(apply()); }
+    catch (err) { result = Promise.reject(err); }
+    return result.finally(() => { _stickyQueueDepth -= 1; });
   };
-  const result = _stickyCommitChain.then(apply, apply);
+  if (_stickyQueueDepth === 1) {
+    _stickyCommitChain = run();
+    return _stickyCommitChain;
+  }
+  const result = _stickyCommitChain.then(run, run);
   _stickyCommitChain = result.catch(() => {});
   return result;
 }
 
-// Inheritance must observe a save that has finished. The map holds a preset
-// that is still being written; reading it there copies a value that may be
-// rolled back. Wait until the chain is idle, then read.
-async function waitForStickyCommits() {
-  let pending = _stickyCommitChain;
-  for (;;) {
-    await pending;
-    if (pending === _stickyCommitChain) return;
-    pending = _stickyCommitChain;
+// The map is committed only when this runs: earlier writes on the chain have
+// already been saved or rolled back. Callers must not read stickyTabs while
+// another operation is still in persist.
+async function applyStickyChange(tabId, slot) {
+  if (slot != null && closedStickyTabs.has(tabId)) {
+    return { ok: false, error: 'tab closed' };
   }
+  const had = stickyTabs.has(tabId);
+  const previous = stickyTabs.get(tabId);
+  if (slot == null) {
+    if (!had) return { ok: true };
+    stickyTabs.delete(tabId);
+  } else {
+    stickyTabs.set(tabId, slot);
+  }
+  const saved = await persistStickyTabs();
+  if (!saved.ok) {
+    if (had) stickyTabs.set(tabId, previous);
+    else stickyTabs.delete(tabId);
+  }
+  return saved;
 }
 
-browser.tabs.onCreated.addListener(async (tab) => {
-  try { await hydrateStickyTabs(); } catch { return; }
-  await waitForStickyCommits();
-  const openerId = tab.openerTabId;
-  if (openerId == null) return;
-  const slot = stickyTabs.get(openerId);
-  if (slot == null) return;
-  const saved = await commitStickyChange(tab.id, slot);
-  if (!saved.ok) return;
-  debugLog('info', 'system', 'sticky inherited from opener', {
-    newTabId: tab.id, openerTabId: openerId, slot,
+function commitStickyChange(tabId, slot) {
+  return enqueueSticky(() => applyStickyChange(tabId, slot));
+}
+
+// Queue inheritance when the tab is created, ahead of any later SET from that
+// tab. The opener slot is read inside the operation, after earlier saves have
+// settled, so a failed write is not copied and a child's own SET is not overwritten.
+browser.tabs.onCreated.addListener((tab) => {
+  return enqueueSticky(async () => {
+    try { await hydrateStickyTabs(); } catch { return; }
+    if (tab?.id == null || closedStickyTabs.has(tab.id)) return;
+    if (stickyTabs.has(tab.id)) return;
+    const openerId = tab.openerTabId;
+    if (openerId == null) return;
+    const slot = stickyTabs.get(openerId);
+    if (slot == null) return;
+    const saved = await applyStickyChange(tab.id, slot);
+    if (!saved.ok) return;
+    debugLog('info', 'system', 'sticky inherited from opener', {
+      newTabId: tab.id, openerTabId: openerId, slot,
+    });
   });
 });
 
@@ -387,8 +401,10 @@ const messageHandlers = {
       await hydrateStickyTabs();
       const tabId = sender?.tab?.id;
       if (tabId == null) return { ok: true, shouldTranslate: false };
-      const slot = stickyTabs.get(tabId);
-      return { ok: true, shouldTranslate: slot != null, slot: slot ?? null };
+      return enqueueSticky(async () => {
+        const slot = stickyTabs.get(tabId);
+        return { ok: true, shouldTranslate: slot != null, slot: slot ?? null };
+      });
     },
   },
   STICKY_SET: {

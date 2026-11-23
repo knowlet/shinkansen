@@ -314,6 +314,59 @@ test('closing a tab drops a preset that has not been applied yet', async () => {
   expect(await h.send('STICKY_QUERY', 1)).toMatchObject({ shouldTranslate: false });
 });
 
+test('a child query waits for inheritance instead of missing an in-flight opener save', async () => {
+  const h = setup({ gateWrites: true });
+  const set = h.send('STICKY_SET', 1, { slot: 3 });
+  await flush();
+  h.reads[0].resolve({ stickyTabs: {} });
+  await flush();
+  const child = h.created({ id: 2, openerTabId: 1 });
+  let settled = false;
+  const query = h.send('STICKY_QUERY', 2).then(r => { settled = true; return r; });
+  await flush();
+  expect(settled).toBe(false);
+  h.pendingWrites[0].gate.resolve();
+  await flush();
+  expect(h.pendingWrites[1].value).toEqual({ stickyTabs: { 1: 3, 2: 3 } });
+  h.pendingWrites[1].gate.resolve();
+  expect(await query).toMatchObject({ shouldTranslate: true, slot: 3 });
+  await child;
+});
+
+test('inheritance queued at creation does not overwrite the child preset', async () => {
+  const h = setup({ gateWrites: true });
+  const set = h.send('STICKY_SET', 1, { slot: 3 });
+  await flush();
+  h.reads[0].resolve({ stickyTabs: {} });
+  await flush();
+  const child = h.created({ id: 2, openerTabId: 1 });
+  const childSet = h.send('STICKY_SET', 2, { slot: 1 });
+  h.pendingWrites[0].gate.resolve();
+  await flush();
+  h.pendingWrites[1].gate.resolve();
+  await flush();
+  h.pendingWrites[2].gate.resolve();
+  expect(await childSet).toMatchObject({ ok: true });
+  await child;
+  expect(h.writes.at(-1)).toEqual({ stickyTabs: { 1: 3, 2: 1 } });
+  expect(await h.send('STICKY_QUERY', 2)).toMatchObject({ shouldTranslate: true, slot: 1 });
+});
+
+test('STICKY_QUERY does not report a slot whose write is still in flight', async () => {
+  const h = setup({ gateWrites: true });
+  const set = h.send('STICKY_SET', 1, { slot: 3 });
+  await flush();
+  h.reads[0].resolve({ stickyTabs: { 1: 1 } });
+  await flush();
+  let settled = false;
+  const query = h.send('STICKY_QUERY', 1).then(r => { settled = true; return r; });
+  await flush();
+  expect(settled).toBe(false);
+  h.pendingWrites[0].gate.reject(new Error('quota exceeded'));
+  expect(await set).toMatchObject({ ok: false, error: 'quota exceeded' });
+  expect(await query).toMatchObject({ shouldTranslate: true, slot: 1 });
+});
+
 test('a preset set after the tab closed is not saved', async () => {
   const h = setup();
   const removal = h.removed(1);
