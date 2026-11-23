@@ -318,6 +318,88 @@ describe('sticky command failure is shown and reverted', () => {
     expect(env.window.__SK.isSpaObserverActive()).toBe(false);
   });
 
+  test('a second Google translate waits for the in-flight restore and does not start if clear fails', async () => {
+    env = createEnv();
+    const p = addParagraph(env);
+    env.shinkansen.testInject(p, '你好世界，這是一段僅用於測試的長段落。');
+    env.shinkansen.setTestState({
+      translated: true, translatedBy: 'gemini', stickyTranslate: true, stickySlot: 1,
+    });
+    const translatedHTML = p.innerHTML;
+    let googleCalls = 0;
+    env.window.__SK.translateUnitsGoogle = async () => {
+      googleCalls += 1;
+      return { done: 1, failures: [], chars: 4 };
+    };
+    let finishClear;
+    env.chrome.runtime.sendMessage.mockImplementation((msg) => {
+      if (msg?.type === 'STICKY_CLEAR') {
+        return new Promise((resolve) => {
+          finishClear = () => resolve({ ok: false, error: 'temporary storage failure' });
+        });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    const first = env.window.__SK.translatePageGoogle({ slot: 3 });
+    const clearPending = await waitForCondition(() => typeof finishClear === 'function');
+    expect(clearPending).toBe(true);
+    expect(env.shinkansen.getState().translated).toBe(false);
+
+    const second = env.window.__SK.translatePageGoogle({ slot: 3 });
+    await new Promise(r => setImmediate(r));
+    expect(googleCalls).toBe(0);
+
+    finishClear();
+    await Promise.all([first, second]);
+    expect(googleCalls).toBe(0);
+    expect(env.shinkansen.getState().translated).toBe(true);
+    expect(env.shinkansen.getState().stickySlot).toBe(1);
+    expect(p.innerHTML).toBe(translatedHTML);
+  });
+
+  test('failed SET and CLEAR restore the last saved sticky slot, not the unsaved one', async () => {
+    env = createEnv();
+    const p = addParagraph(env);
+    stubGemini(env, p);
+    let finishSet;
+    let finishClear;
+    env.chrome.runtime.sendMessage.mockImplementation((msg) => {
+      if (msg?.type === 'STICKY_SET') {
+        return new Promise((resolve) => {
+          finishSet = () => resolve({ ok: false, error: 'quota exceeded' });
+        });
+      }
+      if (msg?.type === 'STICKY_CLEAR') {
+        return new Promise((resolve) => {
+          finishClear = () => resolve({ ok: false, error: 'quota exceeded' });
+        });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const toasts = watchToasts(env.window);
+
+    const translating = env.window.__SK.translatePage({ slot: 3 });
+    const setPending = await waitForCondition(() => typeof finishSet === 'function');
+    expect(setPending).toBe(true);
+    expect(env.shinkansen.getState().stickySlot).toBe(3);
+
+    restoreViaDebug(env);
+    const clearPending = await waitForCondition(() => typeof finishClear === 'function');
+    expect(clearPending).toBe(true);
+
+    finishSet();
+    finishClear();
+    const shown = await waitForCondition(() => toasts.some(
+      t => t.kind === 'error' && t.msg.includes('已恢復翻譯內容'),
+    ));
+    expect(shown).toBe(true);
+    await translating;
+    expect(env.shinkansen.getState()).toMatchObject({
+      translated: true, stickyTranslate: false, stickySlot: null,
+    });
+  });
+
   test('switching to Google waits for sticky clear and keeps the page when it fails', async () => {
     env = createEnv();
     const p = addParagraph(env);

@@ -330,9 +330,11 @@
     // modelOverride 覆蓋 geminiConfig.model，slot 用於 STICKY_SET。
     // v1.4.13: options.label 由 preset 傳入，在 loading toast 顯示讓使用者知道目前哪個 preset 在跑。
     const labelPrefix = options.label ? `[${options.label}] ` : '';
+    const priorRestore = await settlePendingRestore();
+    if (priorRestore && priorRestore.ok === false) return;
 
     if (STATE.translated) {
-      restorePage();
+      await restorePage();
       return;
     }
 
@@ -667,6 +669,19 @@
   // the rescan and SPA observer. A restore in that window must keep the intent
   // and start them if CLEAR fails and the translated page comes back.
   let stickyServicesWanted = false;
+  // One in-flight restore. translate entry points await this before starting,
+  // because restore clears STATE.translated before STICKY_CLEAR returns.
+  let pendingRestore = null;
+  // Last sticky flags the background accepted. Optimistic SET updates STATE
+  // first; a failed CLEAR must not put that unsaved slot back on the page.
+  let committedSticky = { stickyTranslate: false, stickySlot: null };
+  // Bumped when CLEAR succeeds, so a late SET success cannot resurrect it.
+  let stickyClearGeneration = 0;
+
+  async function settlePendingRestore() {
+    if (!pendingRestore) return null;
+    return pendingRestore;
+  }
 
   async function sendStickyCommand(message) {
     try {
@@ -696,14 +711,23 @@
   // slot 為 null 時只開本頁續翻，不寫背景。有 slot 才送 STICKY_SET。
   async function commitStickySet(slot) {
     const epoch = ++stickyUiEpoch;
+    const clearGen = stickyClearGeneration;
     STATE.stickyTranslate = true;
     STATE.stickySlot = slot ?? null;
-    if (slot == null) return { ok: true };
+    if (slot == null) {
+      if (clearGen === stickyClearGeneration) {
+        committedSticky = { stickyTranslate: true, stickySlot: null };
+      }
+      return { ok: true };
+    }
     const result = await sendStickyCommand({ type: 'STICKY_SET', payload: { slot } });
+    if (result.ok && clearGen === stickyClearGeneration) {
+      committedSticky = { stickyTranslate: true, stickySlot: slot };
+    }
     if (epoch !== stickyUiEpoch) return { ok: true, stale: true };
     if (!result.ok) {
-      STATE.stickyTranslate = false;
-      STATE.stickySlot = null;
+      STATE.stickyTranslate = committedSticky.stickyTranslate;
+      STATE.stickySlot = committedSticky.stickySlot;
     }
     return result;
   }
@@ -756,7 +780,17 @@
 
   // ─── restorePage ─────────────────────────────────────
 
-  async function restorePage() {
+  function restorePage() {
+    if (pendingRestore) return pendingRestore;
+    const run = performRestore();
+    const tracked = run.finally(() => {
+      if (pendingRestore === tracked) pendingRestore = null;
+    });
+    pendingRestore = tracked;
+    return tracked;
+  }
+
+  async function performRestore() {
     const epoch = ++stickyUiEpoch;
     const wasEditing = editModeActive;
     const snapshot = captureStickySurface();
@@ -781,6 +815,8 @@
     if (epoch !== stickyUiEpoch) return { ok: false, stale: true, error: 'superseded' };
     if (!cleared.ok) {
       applyStickySurface(snapshot);
+      STATE.stickyTranslate = committedSticky.stickyTranslate;
+      STATE.stickySlot = committedSticky.stickySlot;
       if (wasEditing) toggleEditMode(true);
       // The translated page is back, so the late-content rescan and the SPA
       // observer/content guard that were running must run again too.
@@ -791,6 +827,8 @@
       return { ok: false, error: cleared.error };
     }
     stickyServicesWanted = false;
+    stickyClearGeneration += 1;
+    committedSticky = { stickyTranslate: false, stickySlot: null };
     browser.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
     SK.showToast('success', '已還原原文', { progress: 1, autoHideMs: 2000 });
     return { ok: true };
@@ -874,9 +912,11 @@
     // v1.4.12: gtOptions.slot 由 preset 快速鍵注入，供 STICKY_SET
     // v1.4.13: gtOptions.label 顯示於 loading toast
     const labelPrefix = gtOptions.label ? `[${gtOptions.label}] ` : '';
+    const priorRestore = await settlePendingRestore();
+    if (priorRestore && priorRestore.ok === false) return;
     // 若同一引擎已翻譯 → 還原（toggle）
     if (STATE.translated && STATE.translatedBy === 'google') {
-      restorePage();
+      await restorePage();
       return;
     }
 
@@ -1051,9 +1091,11 @@
   // v1.4.12: 依 preset slot 觸發對應 engine + model 翻譯。
   // 行為：閒置 → 啟動對應 preset；翻譯中 → abort；已翻譯 → restorePage（任一 slot）。
   async function handleTranslatePreset(slot) {
+    const priorRestore = await settlePendingRestore();
+    if (priorRestore && priorRestore.ok === false) return;
     // 已翻譯：任意 preset 快速鍵皆取消翻譯（統一還原）
     if (STATE.translated) {
-      restorePage();
+      await restorePage();
       return;
     }
     // 翻譯中：abort
@@ -1233,6 +1275,13 @@
       if ('translated' in overrides) STATE.translated = !!overrides.translated;
       if ('stickyTranslate' in overrides) STATE.stickyTranslate = !!overrides.stickyTranslate;
       if ('stickySlot' in overrides) STATE.stickySlot = overrides.stickySlot == null ? null : overrides.stickySlot;
+      if ('translatedBy' in overrides) STATE.translatedBy = overrides.translatedBy || null;
+      if ('stickyTranslate' in overrides || 'stickySlot' in overrides) {
+        committedSticky = {
+          stickyTranslate: STATE.stickyTranslate,
+          stickySlot: STATE.stickySlot,
+        };
+      }
     },
     testRunContentGuard() {
       return SK.testRunContentGuard();
