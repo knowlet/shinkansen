@@ -33,8 +33,11 @@
       SK.translatePage();
     } else if (action === 'RESTORE') {
       if (STATE.translated) {
-        restorePage();
-        respond({ ok: true, restored: true });
+        restorePage().then((outcome) => {
+          respond(outcome.ok
+            ? { ok: true, restored: true }
+            : { ok: false, restored: false, error: outcome.error || 'restore failed' });
+        });
       } else {
         respond({ ok: false, error: 'not translated' });
       }
@@ -94,6 +97,10 @@
 
   let rescanAttempts = 0;
   let rescanTimer = null;
+  // rescanTick clears rescanTimer before it awaits, so the timer alone does
+  // not mean a rescan sequence is still running.
+  let rescanActive = false;
+  let rescanGeneration = 0;
 
   SK.cancelRescan = function cancelRescan() {
     if (rescanTimer) {
@@ -101,21 +108,27 @@
       rescanTimer = null;
     }
     rescanAttempts = 0;
+    rescanActive = false;
+    rescanGeneration += 1;
   };
 
   function scheduleRescanForLateContent() {
     SK.cancelRescan();
-    rescanTimer = setTimeout(rescanTick, SK.RESCAN_DELAYS_MS[0]);
+    rescanActive = true;
+    const generation = rescanGeneration;
+    rescanTimer = setTimeout(() => { rescanTick(generation); }, SK.RESCAN_DELAYS_MS[0]);
   }
 
-  async function rescanTick() {
+  async function rescanTick(generation) {
     rescanTimer = null;
-    if (!STATE.translated) return;
+    if (generation !== rescanGeneration || !STATE.translated) return;
     const newUnits = SK.collectParagraphs();
     if (newUnits.length > 0) {
       try {
-        const { done, failures } = await SK.translateUnits(newUnits);
-        if (!STATE.translated) return;
+        const { done, failures } = await SK.translateUnits(newUnits, {
+          beforeInject: () => generation === rescanGeneration && STATE.translated,
+        });
+        if (generation !== rescanGeneration || !STATE.translated) return;
         if (done > 0) {
           SK.sendLog('info', 'translate', 'rescan caught new units', { done, failures: failures.length, attempt: rescanAttempts + 1 });
         }
@@ -123,9 +136,12 @@
         SK.sendLog('warn', 'translate', 'rescan failed', { error: err.message });
       }
     }
+    if (generation !== rescanGeneration) return;
     rescanAttempts += 1;
     if (rescanAttempts < SK.RESCAN_DELAYS_MS.length) {
-      rescanTimer = setTimeout(rescanTick, SK.RESCAN_DELAYS_MS[rescanAttempts]);
+      rescanTimer = setTimeout(() => { rescanTick(generation); }, SK.RESCAN_DELAYS_MS[rescanAttempts]);
+    } else {
+      rescanActive = false;
     }
   }
 
@@ -192,7 +208,7 @@
 
   // ─── translateUnits ──────────────────────────────────
 
-  SK.translateUnits = async function translateUnits(units, { onProgress, glossary, signal, modelOverride } = {}) {
+  SK.translateUnits = async function translateUnits(units, { onProgress, glossary, signal, modelOverride, beforeInject } = {}) {
     const total = units.length;
     const serialized = units.map(unit => {
       if (unit.kind === 'fragment') {
@@ -262,6 +278,10 @@
         const apiCalls = job.texts.length - cacheHit;
         SK.sendLog('info', 'translate', `batch ${batchIdx + 1}/${jobs.length} done`, { elapsed, cacheHits: cacheHit, apiCalls });
         if (!response?.ok) throw new Error(response?.error || '未知錯誤');
+        // A restore can cancel the rescan while this response is in flight.
+        // The generation check used to run only after injection, which put the
+        // translation back onto a page that had already been restored.
+        if (signal?.aborted || (beforeInject && beforeInject() === false)) return;
         const translations = response.result;
         if (response.usage) {
           pageUsage.inputTokens += response.usage.inputTokens || 0;
@@ -316,9 +336,11 @@
     // modelOverride 覆蓋 geminiConfig.model，slot 用於 STICKY_SET。
     // v1.4.13: options.label 由 preset 傳入，在 loading toast 顯示讓使用者知道目前哪個 preset 在跑。
     const labelPrefix = options.label ? `[${options.label}] ` : '';
+    const priorRestore = await settlePendingRestore();
+    if (priorRestore && priorRestore.ok === false) return;
 
     if (STATE.translated) {
-      restorePage();
+      await restorePage();
       return;
     }
 
@@ -371,6 +393,7 @@
     }
 
     STATE.translating = true;
+    stickyUiEpoch += 1;
     STATE.abortController = new AbortController();
     const translateStartTime = Date.now();
     const abortSignal = STATE.abortController.signal;
@@ -542,15 +565,15 @@
 
       STATE.translated = true;
       STATE.translatedBy = 'gemini';  // v1.4.0
-      STATE.stickyTranslate = true;
-      STATE.stickySlot = options.slot ?? null;  // v1.4.12: 記錄 preset slot 供 SPA 續翻 + 跨 tab 繼承
       browser.runtime.sendMessage({ type: 'SET_BADGE_TRANSLATED' }).catch(() => {});
-      // v1.4.11 跨 tab sticky（v1.4.12 改存 preset slot）：opener 鏈中新開的 tab 繼承同 slot
-      if (options.slot != null) {
-        browser.runtime.sendMessage({ type: 'STICKY_SET', payload: { slot: options.slot } }).catch(() => {});
-      }
+      // v1.4.11 跨 tab sticky（v1.4.12 改存 preset slot）：opener 鏈中新開的 tab 繼承同 slot。
+      // 背景回 ok:false（或通道失敗）時不能留著成功提示，並把續翻狀態收回。
+      stickyServicesWanted = true;
+      const sticky = await commitStickySet(options.slot);
 
-      if (!failures.length) {
+      if (!sticky.stale && !sticky.ok) {
+        if (!failures.length) showStickyFailure('set', sticky.error);
+      } else if (!sticky.stale && !failures.length) {
         const totalTokens = pageUsage.inputTokens + pageUsage.outputTokens;
         const successMsg = truncatedCount > 0
           ? `翻譯完成 （${total} 段，另有 ${truncatedCount} 段因頁面過長被略過）`
@@ -622,8 +645,14 @@
         }, 1500);
       }
 
-      scheduleRescanForLateContent();
-      SK.startSpaObserver();
+      // A restore (or a newer translation) that ran while SET was pending
+      // owns the page now; do not restart services it stopped. A failed clear
+      // already started them from stickyServicesWanted.
+      stickyServicesWanted = false;
+      if (!sticky.stale) {
+        scheduleRescanForLateContent();
+        SK.startSpaObserver();
+      }
     } catch (err) {
       SK.sendLog('error', 'translate', 'translatePage error', { error: err.message || String(err) });
       if (!abortSignal.aborted) {
@@ -635,10 +664,146 @@
     }
   };
 
+  // ─── sticky 命令結果 ─────────────────────────────────
+  // 背景的 STICKY_SET / STICKY_CLEAR 可能回 { ok:false }（session 讀寫失敗）。
+  // 舊路徑把 sendMessage 的結果丟掉，畫面仍顯示成功。這裡要看 ok，失敗就改錯誤提示，
+  // 並把已經樂觀改過的續翻／還原狀態收回。stickyUiEpoch 讓進行中的舊命令不要蓋掉
+  // 後續的翻譯或還原。
+
+  let stickyUiEpoch = 0;
+  // Set while a finished translation is waiting on STICKY_SET before it starts
+  // the rescan and SPA observer. A restore in that window must keep the intent
+  // and start them if CLEAR fails and the translated page comes back.
+  let stickyServicesWanted = false;
+  // One in-flight restore. translate entry points await this before starting,
+  // because restore clears STATE.translated before STICKY_CLEAR returns.
+  let pendingRestore = null;
+  // Last sticky flags the background accepted. Optimistic SET updates STATE
+  // first; a failed CLEAR must not put that unsaved slot back on the page.
+  let committedSticky = { stickyTranslate: false, stickySlot: null };
+  // Bumped when CLEAR succeeds, so a late SET success cannot resurrect it.
+  let stickyClearGeneration = 0;
+
+  async function settlePendingRestore() {
+    if (!pendingRestore) return null;
+    return pendingRestore;
+  }
+
+  async function sendStickyCommand(message) {
+    try {
+      const res = await browser.runtime.sendMessage(message);
+      if (!res || res.ok === false) {
+        return { ok: false, error: res?.error || 'sticky update failed' };
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  }
+
+  function showStickyFailure(action, error) {
+    const msg = action === 'set'
+      ? '跨分頁續翻未能儲存，此頁不會跟著開新分頁自動翻譯'
+      : action === 'reload'
+        ? '重新載入後未能清除跨分頁續翻'
+        : '跨分頁續翻未能清除，已恢復翻譯內容';
+    SK.showToast('error', msg, {
+      stopTimer: true,
+      autoHideMs: 4000,
+      ...(error ? { detail: error } : {}),
+    });
+  }
+
+  // slot 為 null 時只開本頁續翻，不寫背景。有 slot 才送 STICKY_SET。
+  async function commitStickySet(slot) {
+    const epoch = ++stickyUiEpoch;
+    const clearGen = stickyClearGeneration;
+    STATE.stickyTranslate = true;
+    STATE.stickySlot = slot ?? null;
+    if (slot == null) {
+      if (clearGen === stickyClearGeneration) {
+        committedSticky = { stickyTranslate: true, stickySlot: null };
+      }
+      return { ok: true };
+    }
+    const result = await sendStickyCommand({ type: 'STICKY_SET', payload: { slot } });
+    if (result.ok && clearGen === stickyClearGeneration) {
+      committedSticky = { stickyTranslate: true, stickySlot: slot };
+    }
+    if (epoch !== stickyUiEpoch) return { ok: true, stale: true };
+    if (!result.ok) {
+      STATE.stickyTranslate = committedSticky.stickyTranslate;
+      STATE.stickySlot = committedSticky.stickySlot;
+    }
+    return result;
+  }
+
+  function captureStickySurface() {
+    const elements = new Map();
+    const remember = (el) => {
+      if (elements.has(el)) return;
+      elements.set(el, {
+        el,
+        html: el.innerHTML,
+        translatedAttr: el.getAttribute('data-shinkansen-translated'),
+        editable: el.getAttribute('contenteditable'),
+        editableClass: el.classList.contains('shinkansen-editable'),
+        hasOriginalHTML: STATE.originalHTML.has(el),
+        originalHTML: STATE.originalHTML.get(el),
+        hasTranslatedHTML: STATE.translatedHTML.has(el),
+        translatedHTML: STATE.translatedHTML.get(el),
+      });
+    };
+    for (const el of STATE.originalHTML.keys()) remember(el);
+    for (const el of STATE.translatedHTML.keys()) remember(el);
+    return {
+      translated: STATE.translated,
+      translatedBy: STATE.translatedBy,
+      stickyTranslate: STATE.stickyTranslate,
+      stickySlot: STATE.stickySlot,
+      elements: [...elements.values()],
+    };
+  }
+
+  function applyStickySurface(snapshot) {
+    STATE.originalHTML.clear();
+    STATE.translatedHTML.clear();
+    for (const item of snapshot.elements) {
+      item.el.innerHTML = item.html;
+      if (item.translatedAttr == null) item.el.removeAttribute('data-shinkansen-translated');
+      else item.el.setAttribute('data-shinkansen-translated', item.translatedAttr);
+      if (item.editable == null) item.el.removeAttribute('contenteditable');
+      else item.el.setAttribute('contenteditable', item.editable);
+      item.el.classList.toggle('shinkansen-editable', item.editableClass);
+      if (item.hasOriginalHTML) STATE.originalHTML.set(item.el, item.originalHTML);
+      if (item.hasTranslatedHTML) STATE.translatedHTML.set(item.el, item.translatedHTML);
+    }
+    STATE.translated = snapshot.translated;
+    STATE.translatedBy = snapshot.translatedBy;
+    STATE.stickyTranslate = snapshot.stickyTranslate;
+    STATE.stickySlot = snapshot.stickySlot;
+  }
+
   // ─── restorePage ─────────────────────────────────────
 
   function restorePage() {
-    if (editModeActive) toggleEditMode(false);
+    if (pendingRestore) return pendingRestore;
+    const run = performRestore();
+    const tracked = run.finally(() => {
+      if (pendingRestore === tracked) pendingRestore = null;
+    });
+    pendingRestore = tracked;
+    return tracked;
+  }
+
+  async function performRestore() {
+    const epoch = ++stickyUiEpoch;
+    const wasEditing = editModeActive;
+    const snapshot = captureStickySurface();
+    const rescanWasActive = rescanActive;
+    const observerWasActive = SK.isSpaObserverActive();
+    const servicesWanted = stickyServicesWanted;
+    if (wasEditing) toggleEditMode(false);
     SK.cancelRescan();
     SK.stopSpaObserver();
     STATE.originalHTML.forEach((originalHTML, el) => {
@@ -651,10 +816,28 @@
     STATE.translatedBy = null;  // v1.4.0
     STATE.stickyTranslate = false;
     STATE.stickySlot = null;    // v1.4.12
-    browser.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
     // v1.4.11: 清除跨 tab sticky（只影響當前 tab，不影響樹中其他 tab）
-    browser.runtime.sendMessage({ type: 'STICKY_CLEAR' }).catch(() => {});
+    const cleared = await sendStickyCommand({ type: 'STICKY_CLEAR' });
+    if (epoch !== stickyUiEpoch) return { ok: false, stale: true, error: 'superseded' };
+    if (!cleared.ok) {
+      applyStickySurface(snapshot);
+      STATE.stickyTranslate = committedSticky.stickyTranslate;
+      STATE.stickySlot = committedSticky.stickySlot;
+      if (wasEditing) toggleEditMode(true);
+      // The translated page is back, so the late-content rescan and the SPA
+      // observer/content guard that were running must run again too.
+      if (rescanWasActive || servicesWanted) scheduleRescanForLateContent();
+      if (observerWasActive || servicesWanted) SK.startSpaObserver();
+      stickyServicesWanted = false;
+      showStickyFailure('clear', cleared.error);
+      return { ok: false, error: cleared.error };
+    }
+    stickyServicesWanted = false;
+    stickyClearGeneration += 1;
+    committedSticky = { stickyTranslate: false, stickySlot: null };
+    browser.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
     SK.showToast('success', '已還原原文', { progress: 1, autoHideMs: 2000 });
+    return { ok: true };
   }
 
   // ─── v1.4.0: Google Translate 批次送出 ──────────────────────
@@ -735,9 +918,11 @@
     // v1.4.12: gtOptions.slot 由 preset 快速鍵注入，供 STICKY_SET
     // v1.4.13: gtOptions.label 顯示於 loading toast
     const labelPrefix = gtOptions.label ? `[${gtOptions.label}] ` : '';
+    const priorRestore = await settlePendingRestore();
+    if (priorRestore && priorRestore.ok === false) return;
     // 若同一引擎已翻譯 → 還原（toggle）
     if (STATE.translated && STATE.translatedBy === 'google') {
-      restorePage();
+      await restorePage();
       return;
     }
 
@@ -748,19 +933,28 @@
       return;
     }
 
-    // 若 Gemini 翻譯已完成 → 先還原，再用 Google 翻
-    if (STATE.translated) {
-      restorePage();
-    }
-
     if (!navigator.onLine) {
       SK.showToast('error', '目前處於離線狀態，無法翻譯。請確認網路連線後再試', { autoHideMs: 5000 });
       return;
     }
 
-    // 繁中偵測（與 Gemini 相同邏輯）
+    // 若 Gemini 翻譯已完成 → 先等還原完成，再用 Google 翻。
+    // 不能在還原的 STICKY_CLEAR 結束前推進 stickyUiEpoch，否則清除失敗時
+    // 畫面已被清掉、錯誤被當成過期命令丟掉，Google 翻譯仍會開始。
+    if (STATE.translated) {
+      const restored = await restorePage();
+      if (!restored?.ok) return;
+    }
+
+    // 繁中偵測（與 Gemini 相同邏輯）。設定讀取會讓出執行權，兩個同時進來的
+    // 請求都可能通過上面的 translating 檢查。讀完後先同步佔住，後到的不再送批次。
     let settings = {};
     try { settings = await browser.storage.sync.get(null); } catch (_) {}
+    if (STATE.translating) return;
+    STATE.translating = true;
+    STATE.abortController = new AbortController();
+    const translateStartTime = Date.now();
+    const abortSignal = STATE.abortController.signal;
     {
       const skipCheck = settings.skipTraditionalChinesePage === false;
       if (!skipCheck) {
@@ -772,15 +966,12 @@
         const pageSample = (contentRoot.innerText || '').slice(0, 2000);
         if (pageSample.length > 20 && SK.isTraditionalChinese(pageSample)) {
           SK.showToast('error', '此頁面已是繁體中文，不需翻譯', { autoHideMs: 3000 });
+          STATE.translating = false;
+          STATE.abortController = null;
           return;
         }
       }
     }
-
-    STATE.translating = true;
-    STATE.abortController = new AbortController();
-    const translateStartTime = Date.now();
-    const abortSignal = STATE.abortController.signal;
 
     let units = SK.collectParagraphs();
     if (units.length === 0) {
@@ -789,6 +980,8 @@
       STATE.abortController = null;
       return;
     }
+    // 確定這次翻譯會繼續，才讓進行中的舊命令變成過期。
+    stickyUiEpoch += 1;
 
     // 超大頁面防護（沿用相同上限設定）
     let maxTotalUnits = SK.DEFAULT_MAX_TOTAL_UNITS;
@@ -834,15 +1027,14 @@
 
       STATE.translated = true;
       STATE.translatedBy = 'google';  // v1.4.0
-      STATE.stickyTranslate = true;
-      STATE.stickySlot = gtOptions.slot ?? null;  // v1.4.12
       browser.runtime.sendMessage({ type: 'SET_BADGE_TRANSLATED' }).catch(() => {});
       // v1.4.11 跨 tab sticky（v1.4.12 改存 preset slot）：opener 鏈中新開的 tab 繼承同 slot
-      if (gtOptions.slot != null) {
-        browser.runtime.sendMessage({ type: 'STICKY_SET', payload: { slot: gtOptions.slot } }).catch(() => {});
-      }
+      stickyServicesWanted = true;
+      const sticky = await commitStickySet(gtOptions.slot);
 
-      if (!failures.length) {
+      if (!sticky.stale && !sticky.ok) {
+        if (!failures.length) showStickyFailure('set', sticky.error);
+      } else if (!sticky.stale && !failures.length) {
         const successMsg = truncatedCount > 0
           ? `Google 翻譯完成（${total} 段，另有 ${truncatedCount} 段因頁面過長被略過）`
           : `Google 翻譯完成（${total} 段）`;
@@ -858,8 +1050,14 @@
         segments: total, chars, elapsed: Date.now() - translateStartTime, url: location.href,
       });
 
-      scheduleRescanForLateContent();
-      SK.startSpaObserver();
+      // A restore (or a newer translation) that ran while SET was pending
+      // owns the page now; do not restart services it stopped. A failed clear
+      // already started them from stickyServicesWanted.
+      stickyServicesWanted = false;
+      if (!sticky.stale) {
+        scheduleRescanForLateContent();
+        SK.startSpaObserver();
+      }
     } catch (err) {
       SK.sendLog('error', 'translate', 'translatePageGoogle error', { error: err.message || String(err) });
       if (!abortSignal.aborted) {
@@ -902,9 +1100,11 @@
   // v1.4.12: 依 preset slot 觸發對應 engine + model 翻譯。
   // 行為：閒置 → 啟動對應 preset；翻譯中 → abort；已翻譯 → restorePage（任一 slot）。
   async function handleTranslatePreset(slot) {
+    const priorRestore = await settlePendingRestore();
+    if (priorRestore && priorRestore.ok === false) return;
     // 已翻譯：任意 preset 快速鍵皆取消翻譯（統一還原）
     if (STATE.translated) {
-      restorePage();
+      await restorePage();
       return;
     }
     // 翻譯中：abort
@@ -1074,6 +1274,7 @@
         translated: STATE.translated,
         translating: STATE.translating,
         stickyTranslate: STATE.stickyTranslate,
+        stickySlot: STATE.stickySlot,
         replacedCount: STATE.originalHTML.size,
         cacheSize: STATE.cache.size,
         guardCacheSize: STATE.translatedHTML.size,
@@ -1082,6 +1283,14 @@
     setTestState(overrides) {
       if ('translated' in overrides) STATE.translated = !!overrides.translated;
       if ('stickyTranslate' in overrides) STATE.stickyTranslate = !!overrides.stickyTranslate;
+      if ('stickySlot' in overrides) STATE.stickySlot = overrides.stickySlot == null ? null : overrides.stickySlot;
+      if ('translatedBy' in overrides) STATE.translatedBy = overrides.translatedBy || null;
+      if ('stickyTranslate' in overrides || 'stickySlot' in overrides) {
+        committedSticky = {
+          stickyTranslate: STATE.stickyTranslate,
+          stickySlot: STATE.stickySlot,
+        };
+      }
     },
     testRunContentGuard() {
       return SK.testRunContentGuard();
@@ -1139,14 +1348,25 @@
         navType = performance.getEntriesByType('navigation')?.[0]?.type || null;
       } catch { /* 舊環境不支援，視為 navigate */ }
       if (navType === 'reload') {
-        await browser.runtime.sendMessage({ type: 'STICKY_CLEAR' }).catch(() => {});
-        SK.sendLog('info', 'system', 'page reload, sticky cleared', { navType, url: location.href });
+        const cleared = await sendStickyCommand({ type: 'STICKY_CLEAR' });
+        if (cleared.ok) {
+          SK.sendLog('info', 'system', 'page reload, sticky cleared', { navType, url: location.href });
+        } else {
+          SK.sendLog('warn', 'system', 'page reload, sticky clear failed', {
+            navType, url: location.href, error: cleared.error,
+          });
+          showStickyFailure('reload', cleared.error);
+        }
       } else {
         // v1.4.11 跨 tab sticky（v1.4.12 改傳 preset slot）：opener tab 的 preset 延用到此 tab
         const stickyResp = await browser.runtime.sendMessage({ type: 'STICKY_QUERY' }).catch(() => null);
         if (stickyResp?.shouldTranslate && stickyResp.slot != null) {
-          SK.sendLog('info', 'system', 'sticky translate inherited from opener tab, triggering preset', { slot: stickyResp.slot, url: location.href });
-          handleTranslatePreset(Number(stickyResp.slot));
+          const inheritedSlot = Number(stickyResp.slot);
+          // The background already has this slot. A later SET/CLEAR failure
+          // must roll the page back to it, not to the empty default.
+          committedSticky = { stickyTranslate: true, stickySlot: inheritedSlot };
+          SK.sendLog('info', 'system', 'sticky translate inherited from opener tab, triggering preset', { slot: inheritedSlot, url: location.href });
+          handleTranslatePreset(inheritedSlot);
           return;
         }
       }

@@ -178,50 +178,144 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 const stickyTabs = new Map(); // tabId → slot (number)
 let _stickyHydrated = false;
+let _stickyHydrationPromise = null;
 
-async function hydrateStickyTabs() {
-  if (_stickyHydrated) return;
-  _stickyHydrated = true;
+// The saved map is required only while this worker has not loaded it. A later
+// mutation persists the in-memory map and does not read again. While the map
+// is still unknown, one transient get() failure is retried immediately — no
+// delay — so SET/CLEAR can still merge and write. A second failure still
+// refuses the write; persisting the empty map would erase saved tabs.
+async function readStickySession() {
   try {
-    const { stickyTabs: saved } = await browser.storage.session.get('stickyTabs');
-    if (saved && typeof saved === 'object') {
-      for (const [tabId, slot] of Object.entries(saved)) {
-        // v1.4.12 前的舊值是 'gemini'/'google' 字串，重啟後忽略舊格式避免誤觸發
-        if (typeof slot === 'number') stickyTabs.set(Number(tabId), slot);
-      }
-    }
+    return await browser.storage.session.get('stickyTabs');
   } catch (err) {
-    debugLog('warn', 'system', 'hydrateStickyTabs failed', { error: err.message });
+    debugLog('warn', 'system', 'sticky session read failed, retrying once', {
+      error: err?.message || String(err),
+    });
+    return browser.storage.session.get('stickyTabs');
   }
 }
 
+async function hydrateStickyTabs() {
+  if (_stickyHydrated) return;
+  // Every startup reader/mutation must wait for the same saved-state snapshot.
+  if (!_stickyHydrationPromise) {
+    _stickyHydrationPromise = (async () => {
+      try {
+        const stored = await readStickySession();
+        const saved = stored?.stickyTabs;
+        if (saved && typeof saved === 'object') {
+          for (const [tabId, slot] of Object.entries(saved)) {
+            // v1.4.12 前的舊值是 'gemini'/'google' 字串，重啟後忽略舊格式避免誤觸發
+            if (typeof slot === 'number') stickyTabs.set(Number(tabId), slot);
+          }
+        }
+        _stickyHydrated = true;
+      } catch (err) {
+        debugLog('warn', 'system', 'hydrateStickyTabs failed', { error: err?.message || String(err) });
+        throw err;
+      }
+    })().finally(() => { _stickyHydrationPromise = null; });
+  }
+  await _stickyHydrationPromise;
+}
+
+// Returns { ok, error }. A rejected write is reported to the caller instead of
+// being treated as saved.
 async function persistStickyTabs() {
   try {
     const obj = {};
     stickyTabs.forEach((slot, tabId) => { obj[tabId] = slot; });
     await browser.storage.session.set({ stickyTabs: obj });
+    return { ok: true };
   } catch (err) {
-    debugLog('warn', 'system', 'persistStickyTabs failed', { error: err.message });
+    const error = err?.message || String(err);
+    debugLog('warn', 'system', 'persistStickyTabs failed', { error });
+    return { ok: false, error };
   }
 }
 
-browser.tabs.onCreated.addListener(async (tab) => {
-  await hydrateStickyTabs();
-  const openerId = tab.openerTabId;
-  if (openerId == null) return;
-  const slot = stickyTabs.get(openerId);
-  if (slot == null) return;
-  stickyTabs.set(tab.id, slot);
-  await persistStickyTabs();
-  debugLog('info', 'system', 'sticky inherited from opener', {
-    newTabId: tab.id, openerTabId: openerId, slot,
+// Apply one tab change and persist it. When the write is rejected the
+// in-memory map goes back to the last successfully written value, so a later
+// write cannot save a change the caller was told had failed.
+// Changes are applied one at a time: each write snapshots the whole map, so a
+// second change must not start until the first has been saved or rolled back.
+// Otherwise its snapshot could persist the first change after that change was
+// reported as failed, and a rollback could erase a newer successful value.
+let _stickyCommitChain = Promise.resolve();
+let _stickyQueueDepth = 0;
+const closedStickyTabs = new Set();
+
+function enqueueSticky(apply) {
+  _stickyQueueDepth += 1;
+  const run = () => {
+    let result;
+    try { result = Promise.resolve(apply()); }
+    catch (err) { result = Promise.reject(err); }
+    return result.finally(() => { _stickyQueueDepth -= 1; });
+  };
+  if (_stickyQueueDepth === 1) {
+    _stickyCommitChain = run();
+    return _stickyCommitChain;
+  }
+  const result = _stickyCommitChain.then(run, run);
+  _stickyCommitChain = result.catch(() => {});
+  return result;
+}
+
+// The map is committed only when this runs: earlier writes on the chain have
+// already been saved or rolled back. Callers must not read stickyTabs while
+// another operation is still in persist.
+async function applyStickyChange(tabId, slot) {
+  if (slot != null && closedStickyTabs.has(tabId)) {
+    return { ok: false, error: 'tab closed' };
+  }
+  const had = stickyTabs.has(tabId);
+  const previous = stickyTabs.get(tabId);
+  if (slot == null) {
+    if (!had) return { ok: true };
+    stickyTabs.delete(tabId);
+  } else {
+    stickyTabs.set(tabId, slot);
+  }
+  const saved = await persistStickyTabs();
+  if (!saved.ok) {
+    if (had) stickyTabs.set(tabId, previous);
+    else stickyTabs.delete(tabId);
+  }
+  return saved;
+}
+
+function commitStickyChange(tabId, slot) {
+  return enqueueSticky(() => applyStickyChange(tabId, slot));
+}
+
+// Queue inheritance when the tab is created, ahead of any later SET from that
+// tab. The opener slot is read inside the operation, after earlier saves have
+// settled, so a failed write is not copied and a child's own SET is not overwritten.
+browser.tabs.onCreated.addListener((tab) => {
+  return enqueueSticky(async () => {
+    try { await hydrateStickyTabs(); } catch { return; }
+    if (tab?.id == null || closedStickyTabs.has(tab.id)) return;
+    if (stickyTabs.has(tab.id)) return;
+    const openerId = tab.openerTabId;
+    if (openerId == null) return;
+    const slot = stickyTabs.get(openerId);
+    if (slot == null) return;
+    const saved = await applyStickyChange(tab.id, slot);
+    if (!saved.ok) return;
+    debugLog('info', 'system', 'sticky inherited from opener', {
+      newTabId: tab.id, openerTabId: openerId, slot,
+    });
   });
 });
 
 browser.tabs.onRemoved.addListener(async (tabId) => {
-  if (!stickyTabs.has(tabId)) return;
-  stickyTabs.delete(tabId);
-  await persistStickyTabs();
+  // Record the close before any await. A SET queued behind hydration has not
+  // touched the map yet; bailing on !has would let that SET save a closed tab.
+  closedStickyTabs.add(tabId);
+  try { await hydrateStickyTabs(); } catch { return; }
+  await commitStickyChange(tabId, null);
 });
 
 // ─── 訊息路由（handler map 取代 if-else 鏈） ──────────────────
@@ -303,36 +397,40 @@ const messageHandlers = {
   // v1.4.11 跨 tab sticky 翻譯（v1.4.12 起 value = preset slot number）
   STICKY_QUERY: {
     async: true,
-    handler: async (_, sender) => {
-      await hydrateStickyTabs();
+    handler: (_, sender) => {
       const tabId = sender?.tab?.id;
-      if (tabId == null) return { ok: true, shouldTranslate: false };
-      const slot = stickyTabs.get(tabId);
-      return { ok: true, shouldTranslate: slot != null, slot: slot ?? null };
+      if (tabId == null) return Promise.resolve({ ok: true, shouldTranslate: false });
+      // Join the queue before hydration. A child tab created while the startup
+      // read is pending must not run ahead of a SET or CLEAR that arrived first.
+      return enqueueSticky(async () => {
+        await hydrateStickyTabs();
+        const slot = stickyTabs.get(tabId);
+        return { ok: true, shouldTranslate: slot != null, slot: slot ?? null };
+      });
     },
   },
   STICKY_SET: {
     async: true,
-    handler: async (payload, sender) => {
-      await hydrateStickyTabs();
+    handler: (payload, sender) => {
       const tabId = sender?.tab?.id;
-      if (tabId == null) return { ok: false, error: 'no tab id' };
+      if (tabId == null) return Promise.resolve({ ok: false, error: 'no tab id' });
       const slot = Number(payload?.slot);
-      if (!Number.isInteger(slot) || slot < 1) return { ok: false, error: 'invalid slot' };
-      stickyTabs.set(tabId, slot);
-      await persistStickyTabs();
-      return { ok: true };
+      if (!Number.isInteger(slot) || slot < 1) return Promise.resolve({ ok: false, error: 'invalid slot' });
+      return enqueueSticky(async () => {
+        await hydrateStickyTabs();
+        return applyStickyChange(tabId, slot);
+      });
     },
   },
   STICKY_CLEAR: {
     async: true,
-    handler: async (_, sender) => {
-      await hydrateStickyTabs();
+    handler: (_, sender) => {
       const tabId = sender?.tab?.id;
-      if (tabId == null) return { ok: false };
-      stickyTabs.delete(tabId);
-      await persistStickyTabs();
-      return { ok: true };
+      if (tabId == null) return Promise.resolve({ ok: false });
+      return enqueueSticky(async () => {
+        await hydrateStickyTabs();
+        return applyStickyChange(tabId, null);
+      });
     },
   },
   LOG: {
