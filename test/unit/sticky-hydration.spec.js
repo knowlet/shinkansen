@@ -12,16 +12,20 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 const event = () => ({ addListener(fn) { this.listener = fn; } });
-function setup() {
+function setup({ rejectWrites = 0 } = {}) {
   const reads = [];
   const writes = [];
+  let failuresLeft = rejectWrites;
   const browser = {
     runtime: { getManifest: () => ({ version: 'test' }), onMessage: event(), onInstalled: event() },
     storage: {
       onChanged: event(),
       session: {
         get() { const gate = deferred(); reads.push(gate); return gate.promise; },
-        async set(value) { writes.push(JSON.parse(JSON.stringify(value))); },
+        async set(value) {
+          if (failuresLeft > 0) { failuresLeft -= 1; throw new Error('quota exceeded'); }
+          writes.push(JSON.parse(JSON.stringify(value)));
+        },
       },
     },
     tabs: { onCreated: event(), onRemoved: event(), onUpdated: event() },
@@ -220,5 +224,20 @@ for (const action of ['created', 'removed']) {
     await flush();
     h.reads[2].resolve({ stickyTabs: { 1: 2 } });
     expect(await query).toMatchObject({ slot: 2 });
+  });
+}
+
+for (const type of ['STICKY_SET', 'STICKY_CLEAR']) {
+  test(`${type} reports a rejected session write and keeps the last saved map`, async () => {
+    const h = setup({ rejectWrites: 1 });
+    const mutation = h.send(type, 1, { slot: 3 });
+    await flush();
+    h.reads[0].resolve({ stickyTabs: { 1: 1, 2: 2 } });
+    expect(await mutation).toMatchObject({ ok: false, error: 'quota exceeded' });
+    expect(h.writes).toHaveLength(0);
+    expect(await h.send('STICKY_QUERY', 1)).toMatchObject({ shouldTranslate: true, slot: 1 });
+    // The next successful write must not carry the rejected change.
+    expect(await h.send('STICKY_SET', 2, { slot: 3 })).toMatchObject({ ok: true });
+    expect(h.writes.at(-1)).toEqual({ stickyTabs: { 1: 1, 2: 3 } });
   });
 }
