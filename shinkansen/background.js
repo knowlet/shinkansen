@@ -238,17 +238,27 @@ async function persistStickyTabs() {
 // Apply one tab change and persist it. When the write is rejected the
 // in-memory map goes back to the last successfully written value, so a later
 // write cannot save a change the caller was told had failed.
-async function commitStickyChange(tabId, slot) {
-  const had = stickyTabs.has(tabId);
-  const previous = stickyTabs.get(tabId);
-  if (slot == null) stickyTabs.delete(tabId);
-  else stickyTabs.set(tabId, slot);
-  const saved = await persistStickyTabs();
-  if (!saved.ok) {
-    if (had) stickyTabs.set(tabId, previous);
-    else stickyTabs.delete(tabId);
-  }
-  return saved;
+// Changes are applied one at a time: each write snapshots the whole map, so a
+// second change must not start until the first has been saved or rolled back.
+// Otherwise its snapshot could persist the first change after that change was
+// reported as failed, and a rollback could erase a newer successful value.
+let _stickyCommitChain = Promise.resolve();
+function commitStickyChange(tabId, slot) {
+  const apply = async () => {
+    const had = stickyTabs.has(tabId);
+    const previous = stickyTabs.get(tabId);
+    if (slot == null) stickyTabs.delete(tabId);
+    else stickyTabs.set(tabId, slot);
+    const saved = await persistStickyTabs();
+    if (!saved.ok) {
+      if (had) stickyTabs.set(tabId, previous);
+      else stickyTabs.delete(tabId);
+    }
+    return saved;
+  };
+  const result = _stickyCommitChain.then(apply, apply);
+  _stickyCommitChain = result.catch(() => {});
+  return result;
 }
 
 browser.tabs.onCreated.addListener(async (tab) => {

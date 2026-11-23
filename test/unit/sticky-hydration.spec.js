@@ -12,9 +12,10 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 const event = () => ({ addListener(fn) { this.listener = fn; } });
-function setup({ rejectWrites = 0 } = {}) {
+function setup({ rejectWrites = 0, gateWrites = false } = {}) {
   const reads = [];
   const writes = [];
+  const pendingWrites = [];
   let failuresLeft = rejectWrites;
   const browser = {
     runtime: { getManifest: () => ({ version: 'test' }), onMessage: event(), onInstalled: event() },
@@ -23,8 +24,14 @@ function setup({ rejectWrites = 0 } = {}) {
       session: {
         get() { const gate = deferred(); reads.push(gate); return gate.promise; },
         async set(value) {
+          const snapshot = JSON.parse(JSON.stringify(value));
+          if (gateWrites) {
+            const gate = deferred();
+            pendingWrites.push({ value: snapshot, gate });
+            await gate.promise;
+          }
           if (failuresLeft > 0) { failuresLeft -= 1; throw new Error('quota exceeded'); }
-          writes.push(JSON.parse(JSON.stringify(value)));
+          writes.push(snapshot);
         },
       },
     },
@@ -40,7 +47,7 @@ function setup({ rejectWrites = 0 } = {}) {
   const send = (type, tabId, payload) => new Promise(resolve => {
     expect(browser.runtime.onMessage.listener({ type, payload }, { tab: { id: tabId } }, resolve)).toBe(true);
   });
-  return { reads, writes, send,
+  return { reads, writes, pendingWrites, send,
     created: tab => browser.tabs.onCreated.listener(tab),
     removed: id => browser.tabs.onRemoved.listener(id) };
 }
@@ -241,3 +248,39 @@ for (const type of ['STICKY_SET', 'STICKY_CLEAR']) {
     expect(h.writes.at(-1)).toEqual({ stickyTabs: { 1: 1, 2: 3 } });
   });
 }
+
+test('a failed write is not persisted by a concurrent write for another tab', async () => {
+  const h = setup({ gateWrites: true });
+  const first = h.send('STICKY_SET', 1, { slot: 3 });
+  const second = h.send('STICKY_SET', 2, { slot: 4 });
+  await flush();
+  h.reads[0].resolve({ stickyTabs: { 1: 1, 2: 2 } });
+  await flush();
+  // Only the first change is being written; the second waits for its outcome.
+  expect(h.pendingWrites).toHaveLength(1);
+  expect(h.pendingWrites[0].value).toEqual({ stickyTabs: { 1: 3, 2: 2 } });
+  h.pendingWrites[0].gate.reject(new Error('quota exceeded'));
+  expect(await first).toMatchObject({ ok: false, error: 'quota exceeded' });
+  await flush();
+  expect(h.pendingWrites).toHaveLength(2);
+  expect(h.pendingWrites[1].value).toEqual({ stickyTabs: { 1: 1, 2: 4 } });
+  h.pendingWrites[1].gate.resolve();
+  expect(await second).toMatchObject({ ok: true });
+  expect(h.writes.at(-1)).toEqual({ stickyTabs: { 1: 1, 2: 4 } });
+});
+
+test('rolling back a failed write keeps a newer successful value for the same tab', async () => {
+  const h = setup({ gateWrites: true });
+  const first = h.send('STICKY_SET', 1, { slot: 3 });
+  const second = h.send('STICKY_SET', 1, { slot: 4 });
+  await flush();
+  h.reads[0].resolve({ stickyTabs: { 1: 1 } });
+  await flush();
+  h.pendingWrites[0].gate.reject(new Error('quota exceeded'));
+  expect(await first).toMatchObject({ ok: false });
+  await flush();
+  h.pendingWrites[1].gate.resolve();
+  expect(await second).toMatchObject({ ok: true });
+  expect(h.writes.at(-1)).toEqual({ stickyTabs: { 1: 4 } });
+  expect(await h.send('STICKY_QUERY', 1)).toMatchObject({ slot: 4 });
+});
