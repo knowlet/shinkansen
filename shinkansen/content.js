@@ -125,7 +125,9 @@
     const newUnits = SK.collectParagraphs();
     if (newUnits.length > 0) {
       try {
-        const { done, failures } = await SK.translateUnits(newUnits);
+        const { done, failures } = await SK.translateUnits(newUnits, {
+          beforeInject: () => generation === rescanGeneration && STATE.translated,
+        });
         if (generation !== rescanGeneration || !STATE.translated) return;
         if (done > 0) {
           SK.sendLog('info', 'translate', 'rescan caught new units', { done, failures: failures.length, attempt: rescanAttempts + 1 });
@@ -206,7 +208,7 @@
 
   // ─── translateUnits ──────────────────────────────────
 
-  SK.translateUnits = async function translateUnits(units, { onProgress, glossary, signal, modelOverride } = {}) {
+  SK.translateUnits = async function translateUnits(units, { onProgress, glossary, signal, modelOverride, beforeInject } = {}) {
     const total = units.length;
     const serialized = units.map(unit => {
       if (unit.kind === 'fragment') {
@@ -276,6 +278,10 @@
         const apiCalls = job.texts.length - cacheHit;
         SK.sendLog('info', 'translate', `batch ${batchIdx + 1}/${jobs.length} done`, { elapsed, cacheHits: cacheHit, apiCalls });
         if (!response?.ok) throw new Error(response?.error || '未知錯誤');
+        // A restore can cancel the rescan while this response is in flight.
+        // The generation check used to run only after injection, which put the
+        // translation back onto a page that had already been restored.
+        if (signal?.aborted || (beforeInject && beforeInject() === false)) return;
         const translations = response.result;
         if (response.usage) {
           pageUsage.inputTokens += response.usage.inputTokens || 0;
@@ -940,9 +946,15 @@
       if (!restored?.ok) return;
     }
 
-    // 繁中偵測（與 Gemini 相同邏輯）
+    // 繁中偵測（與 Gemini 相同邏輯）。設定讀取會讓出執行權，兩個同時進來的
+    // 請求都可能通過上面的 translating 檢查。讀完後先同步佔住，後到的不再送批次。
     let settings = {};
     try { settings = await browser.storage.sync.get(null); } catch (_) {}
+    if (STATE.translating) return;
+    STATE.translating = true;
+    STATE.abortController = new AbortController();
+    const translateStartTime = Date.now();
+    const abortSignal = STATE.abortController.signal;
     {
       const skipCheck = settings.skipTraditionalChinesePage === false;
       if (!skipCheck) {
@@ -954,15 +966,12 @@
         const pageSample = (contentRoot.innerText || '').slice(0, 2000);
         if (pageSample.length > 20 && SK.isTraditionalChinese(pageSample)) {
           SK.showToast('error', '此頁面已是繁體中文，不需翻譯', { autoHideMs: 3000 });
+          STATE.translating = false;
+          STATE.abortController = null;
           return;
         }
       }
     }
-
-    STATE.translating = true;
-    STATE.abortController = new AbortController();
-    const translateStartTime = Date.now();
-    const abortSignal = STATE.abortController.signal;
 
     let units = SK.collectParagraphs();
     if (units.length === 0) {
@@ -1352,8 +1361,12 @@
         // v1.4.11 跨 tab sticky（v1.4.12 改傳 preset slot）：opener tab 的 preset 延用到此 tab
         const stickyResp = await browser.runtime.sendMessage({ type: 'STICKY_QUERY' }).catch(() => null);
         if (stickyResp?.shouldTranslate && stickyResp.slot != null) {
-          SK.sendLog('info', 'system', 'sticky translate inherited from opener tab, triggering preset', { slot: stickyResp.slot, url: location.href });
-          handleTranslatePreset(Number(stickyResp.slot));
+          const inheritedSlot = Number(stickyResp.slot);
+          // The background already has this slot. A later SET/CLEAR failure
+          // must roll the page back to it, not to the empty default.
+          committedSticky = { stickyTranslate: true, stickySlot: inheritedSlot };
+          SK.sendLog('info', 'system', 'sticky translate inherited from opener tab, triggering preset', { slot: inheritedSlot, url: location.href });
+          handleTranslatePreset(inheritedSlot);
           return;
         }
       }

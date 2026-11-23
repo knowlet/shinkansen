@@ -90,6 +90,54 @@ test('clearing while hydration is pending does not restore the cleared tab', asy
   expect(h.writes.at(-1)).toEqual({ stickyTabs: { 2: 2 } });
 });
 
+test('a SET that arrives before a child during hydration is what the child inherits', async () => {
+  const h = setup();
+  const set = h.send('STICKY_SET', 1, { slot: 3 });
+  const child = h.created({ id: 4, openerTabId: 1 });
+  await flush();
+  expect(h.reads).toHaveLength(1);
+  h.reads[0].resolve({ stickyTabs: { 1: 1 } });
+  await Promise.all([set, child]);
+  expect(await h.send('STICKY_QUERY', 4)).toMatchObject({ shouldTranslate: true, slot: 3 });
+  expect(h.writes.at(-1)).toEqual({ stickyTabs: { 1: 3, 4: 3 } });
+});
+
+test('a child opened before a SET during hydration keeps the saved opener slot', async () => {
+  const h = setup();
+  const child = h.created({ id: 4, openerTabId: 1 });
+  const set = h.send('STICKY_SET', 1, { slot: 3 });
+  await flush();
+  expect(h.reads).toHaveLength(1);
+  h.reads[0].resolve({ stickyTabs: { 1: 1 } });
+  await Promise.all([child, set]);
+  expect(await h.send('STICKY_QUERY', 4)).toMatchObject({ shouldTranslate: true, slot: 1 });
+  expect(await h.send('STICKY_QUERY', 1)).toMatchObject({ shouldTranslate: true, slot: 3 });
+});
+
+test('a CLEAR that arrives before a child during hydration is not inherited', async () => {
+  const h = setup();
+  const clear = h.send('STICKY_CLEAR', 1);
+  const child = h.created({ id: 4, openerTabId: 1 });
+  await flush();
+  expect(h.reads).toHaveLength(1);
+  h.reads[0].resolve({ stickyTabs: { 1: 1 } });
+  await Promise.all([clear, child]);
+  expect(await h.send('STICKY_QUERY', 1)).toMatchObject({ shouldTranslate: false });
+  expect(await h.send('STICKY_QUERY', 4)).toMatchObject({ shouldTranslate: false });
+});
+
+test('a child opened before CLEAR during hydration keeps the saved slot', async () => {
+  const h = setup();
+  const child = h.created({ id: 4, openerTabId: 1 });
+  const clear = h.send('STICKY_CLEAR', 1);
+  await flush();
+  expect(h.reads).toHaveLength(1);
+  h.reads[0].resolve({ stickyTabs: { 1: 1 } });
+  await Promise.all([child, clear]);
+  expect(await h.send('STICKY_QUERY', 4)).toMatchObject({ shouldTranslate: true, slot: 1 });
+  expect(await h.send('STICKY_QUERY', 1)).toMatchObject({ shouldTranslate: false });
+});
+
 test('a child created during hydration inherits its restored opener slot', async () => {
   const h = setup();
   const query = h.send('STICKY_QUERY', 1);

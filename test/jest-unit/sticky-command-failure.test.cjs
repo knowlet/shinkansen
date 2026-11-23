@@ -480,6 +480,139 @@ describe('sticky command failure is shown and reverted', () => {
     expect(env.shinkansen.getState().translated).toBe(true);
   });
 
+  test('two Google translates waiting on settings send one batch', async () => {
+    env = createEnv();
+    const p = addParagraph(env);
+    env.window.__SK.collectParagraphs = () => [{ kind: 'element', el: p }];
+    const pendingGets = [];
+    env.chrome.storage.sync.get.mockImplementation((keys) => {
+      if (keys === null) {
+        return new Promise((resolve) => { pendingGets.push(resolve); });
+      }
+      return Promise.resolve({});
+    });
+    let batches = 0;
+    env.window.__SK.translateUnitsGoogle = async () => {
+      batches += 1;
+      return { done: 1, failures: [], chars: 4 };
+    };
+    env.chrome.runtime.sendMessage.mockImplementation(() => Promise.resolve({ ok: true }));
+
+    const first = env.window.__SK.translatePageGoogle({ slot: 3 });
+    const second = env.window.__SK.translatePageGoogle({ slot: 3 });
+    const waiting = await waitForCondition(() => pendingGets.length >= 2);
+    expect(waiting).toBe(true);
+    expect(batches).toBe(0);
+    pendingGets.splice(0).forEach((release) => release({}));
+    await Promise.all([first, second]);
+    expect(batches).toBe(1);
+    expect(env.shinkansen.getState().translating).toBe(false);
+  });
+
+  test('a cancelled rescan does not inject into the restored page', async () => {
+    env = createEnv();
+    const p = addParagraph(env);
+    if (p.innerText == null) {
+      Object.defineProperty(p, 'innerText', { configurable: true, get() { return this.textContent; } });
+    }
+    env.window.__SK.collectParagraphs = () => [{ kind: 'element', el: p }];
+    env.window.__SK.RESCAN_DELAYS_MS = [0, 60_000];
+    let batches = 0;
+    let finishRescan;
+    env.chrome.runtime.sendMessage.mockImplementation((msg) => {
+      if (msg?.type === 'TRANSLATE_BATCH') {
+        batches += 1;
+        if (batches === 1) {
+          return Promise.resolve({ ok: true, result: ['第一譯'], usage: {} });
+        }
+        return new Promise((resolve) => {
+          finishRescan = () => resolve({ ok: true, result: ['不該注入'], usage: {} });
+        });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    env.chrome.storage.sync.get.mockImplementation(() => Promise.resolve({}));
+
+    await env.window.__SK.translatePage({ slot: 1 });
+    expect(p.textContent).toContain('第一譯');
+    const pending = await waitForCondition(() => typeof finishRescan === 'function');
+    expect(pending).toBe(true);
+
+    const toasts = watchToasts(env.window);
+    restoreViaDebug(env);
+    const restored = await waitForCondition(() => toasts.some(
+      t => t.kind === 'success' && t.msg === '已還原原文',
+    ));
+    expect(restored).toBe(true);
+    expect(p.textContent).toContain('Hello world');
+
+    finishRescan();
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    expect(p.textContent).not.toContain('不該注入');
+    expect(p.textContent).toContain('Hello world');
+    expect(env.shinkansen.getState().replacedCount).toBe(0);
+    env.window.__SK.cancelRescan();
+  });
+
+  test('an inherited STICKY_QUERY seeds the saved slot before a failed SET or CLEAR', async () => {
+    const dom = new (require('jsdom').JSDOM)(
+      '<!DOCTYPE html><html><body><p>Hello world this is a long paragraph for testing purposes only.</p></body></html>',
+      { url: 'https://example.com/child', runScripts: 'dangerously', pretendToBeVisual: true },
+    );
+    const win = dom.window;
+    let finishQuery;
+    win.chrome = {
+      runtime: {
+        sendMessage: jest.fn().mockImplementation((msg) => {
+          if (msg?.type === 'STICKY_QUERY') {
+            return new Promise((resolve) => {
+              finishQuery = () => resolve({ ok: true, shouldTranslate: true, slot: 2 });
+            });
+          }
+          if (msg?.type === 'STICKY_SET' || msg?.type === 'STICKY_CLEAR') {
+            return Promise.resolve({ ok: false, error: 'quota exceeded' });
+          }
+          return Promise.resolve({ ok: true });
+        }),
+        getManifest: jest.fn().mockReturnValue({ version: 'test' }),
+        onMessage: { addListener: jest.fn() },
+      },
+      storage: {
+        sync: { get: jest.fn().mockImplementation(() => Promise.resolve({})) },
+        onChanged: { addListener: jest.fn() },
+      },
+    };
+    const { contentScriptCodes } = require('./helpers/create-env.cjs');
+    for (const code of contentScriptCodes) win.eval(code);
+    const paragraph = win.document.querySelector('p');
+    win.__SK.collectParagraphs = () => [{ kind: 'element', el: paragraph }];
+    win.__SK.translateUnits = async () => ({
+      done: 1, failures: [], pageUsage, rpdWarning: false,
+    });
+
+    finishQuery();
+    const seeded = await waitForCondition(() => {
+      const state = win.__shinkansen.getState();
+      return state.translated === true && state.translating === false;
+    });
+    expect(seeded).toBe(true);
+    expect(win.__shinkansen.getState()).toMatchObject({
+      stickyTranslate: true, stickySlot: 2,
+    });
+
+    const toasts = watchToasts(win);
+    win.dispatchEvent(new win.CustomEvent('shinkansen-debug-request', { detail: { action: 'RESTORE' } }));
+    const shown = await waitForCondition(() => toasts.some(
+      t => t.kind === 'error' && t.msg.includes('已恢復翻譯內容'),
+    ));
+    expect(shown).toBe(true);
+    expect(win.__shinkansen.getState()).toMatchObject({
+      translated: true, stickyTranslate: true, stickySlot: 2,
+    });
+    win.close();
+  });
+
   test('reload STICKY_CLEAR ok:false shows an error instead of a cleared log', async () => {
     const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', {
       url: 'https://example.com/reloaded',

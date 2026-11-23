@@ -397,11 +397,13 @@ const messageHandlers = {
   // v1.4.11 跨 tab sticky 翻譯（v1.4.12 起 value = preset slot number）
   STICKY_QUERY: {
     async: true,
-    handler: async (_, sender) => {
-      await hydrateStickyTabs();
+    handler: (_, sender) => {
       const tabId = sender?.tab?.id;
-      if (tabId == null) return { ok: true, shouldTranslate: false };
+      if (tabId == null) return Promise.resolve({ ok: true, shouldTranslate: false });
+      // Join the queue before hydration. A child tab created while the startup
+      // read is pending must not run ahead of a SET or CLEAR that arrived first.
       return enqueueSticky(async () => {
+        await hydrateStickyTabs();
         const slot = stickyTabs.get(tabId);
         return { ok: true, shouldTranslate: slot != null, slot: slot ?? null };
       });
@@ -409,22 +411,26 @@ const messageHandlers = {
   },
   STICKY_SET: {
     async: true,
-    handler: async (payload, sender) => {
-      await hydrateStickyTabs();
+    handler: (payload, sender) => {
       const tabId = sender?.tab?.id;
-      if (tabId == null) return { ok: false, error: 'no tab id' };
+      if (tabId == null) return Promise.resolve({ ok: false, error: 'no tab id' });
       const slot = Number(payload?.slot);
-      if (!Number.isInteger(slot) || slot < 1) return { ok: false, error: 'invalid slot' };
-      return commitStickyChange(tabId, slot);
+      if (!Number.isInteger(slot) || slot < 1) return Promise.resolve({ ok: false, error: 'invalid slot' });
+      return enqueueSticky(async () => {
+        await hydrateStickyTabs();
+        return applyStickyChange(tabId, slot);
+      });
     },
   },
   STICKY_CLEAR: {
     async: true,
-    handler: async (_, sender) => {
-      await hydrateStickyTabs();
+    handler: (_, sender) => {
       const tabId = sender?.tab?.id;
-      if (tabId == null) return { ok: false };
-      return commitStickyChange(tabId, null);
+      if (tabId == null) return Promise.resolve({ ok: false });
+      return enqueueSticky(async () => {
+        await hydrateStickyTabs();
+        return applyStickyChange(tabId, null);
+      });
     },
   },
   LOG: {
